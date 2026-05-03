@@ -22,6 +22,20 @@ status: active
 > 本指南具备**知识图谱级双向链接**，任何架构图的部分、组件名词、前沿算法（如 [NaViT](#31-核心组件名词与算法原理详解)、[MRoPE](#71-mrope-多模态旋转位置编码-与可训练结构)、[PatchMerger](#61-组件名词patchmerger-与可训练参数) 等）及其[源码位置](#43-源码逐行解剖)均可互相跳转。
 > 我们将全面拆解网络中**每一个可训练的神经元结构**的参数配置与训练状态，并彻底追溯 Tokenizer 预处理过程的本质。
 
+---
+
+### 1. 模块级整体说明与架构拓扑图
+
+Qwen2.5-VL 标志着经典“三段式”架构的完全成熟。它的整体运行链路可以概括为：**[Processor 预处理打包](#2-模块零processor-像素预处理与-tokenizer) $\rightarrow$ [视觉编码器提取深层特征](#4-模块二视觉骨干网与局部注意力-qwen2_5_vlvisionblock) $\rightarrow$ [PatchMerger 空间降维压缩](#6-模块三空间降维桥接器-qwen2_5_vlpatchmerger-即-projector) $\rightarrow$ [结合绝对时间的 LLM 自回归解码](#7-模块四大语言模型融合与绝对时间-mrope-llm-backbone)**。
+
+#### 1.1 官方架构图：全景导读、模块映射与深度拆解
+
+为了帮助大家彻底吃透官方论文中的架构图，我们严格遵循**全局通读 $\rightarrow$ 剥洋葱式拆解 $\rightarrow$ 模块映射**的准则。
+
+![Qwen2.5-VL Official Architecture](images/Qwen2.5-VL-Architecture.png)
+
+##### 1.1.1 架构图全景导读与剥洋葱式拆解
+
 我们从左到右对图中的每一部分进行"透视"，详细交代它们是什么、有什么作用、参数训练状态与核心技术点。**以下所有 I/O 张量形状均以官方架构图中的三个真实样本为例推导**：
 - **Picture 1**：8204×1092 超宽长图
 - **Picture 2**：28×224 极小图

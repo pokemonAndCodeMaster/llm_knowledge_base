@@ -1,0 +1,203 @@
+{
+  "main": {
+    "id": "4670f3cb2cd7f6fd",
+    "type": "split",
+    "children": [
+      {
+        "id": "17e698e74a81b20f",
+        "type": "tabs",
+        "dimension": 18.01909307875895,
+        "children": [
+          {
+            "id": "0920f970898c364f",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "qwen2.5_vl_深度剖析学习指南 的大纲"
+            }
+          }
+        ]
+      },
+      {
+        "id": "62a7da74572a3751",
+        "type": "tabs",
+        "dimension": 81.98090692124104,
+        "children": [
+          {
+            "id": "457033b13377bb26",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "qwen2.5_vl_深度剖析学习指南"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "596165c4b144fa22",
+    "type": "split",
+    "children": [
+      {
+        "id": "4c726652cf84bf25",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f8995cfc9d739bdf",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "2cbf7ea5c315945e",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "452243d6d8ac6006",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 200
+  },
+  "right": {
+    "id": "b70d191b4edb5207",
+    "type": "split",
+    "children": [
+      {
+        "id": "69001f218332dca6",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "632e990262b0cd8b",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "collapseAll": true,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "qwen2.5_vl_深度剖析学习指南 的反向链接列表"
+            }
+          },
+          {
+            "id": "620f09c64d2eadc1",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "qwen2.5_vl_深度剖析学习指南 的出链列表"
+            }
+          },
+          {
+            "id": "ba5b4e00ede2ce48",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "f15ae82d3555b81a",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          }
+        ],
+        "currentTab": 1
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "f8995cfc9d739bdf",
+  "lastOpenFiles": [
+    "concepts/navit_动态分辨率.md",
+    "synthesis/_fix_guide.py",
+    "concepts/2d_rope_视觉位置编码.md",
+    "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+    "sources/qwen2.5_vl_技术报告解析.md"
+  ]
+}

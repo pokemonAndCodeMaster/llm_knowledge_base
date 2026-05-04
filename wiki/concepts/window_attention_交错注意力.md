@@ -1,6 +1,6 @@
 ---
 title: Window Attention 交错窗口注意力
-tags: [概念, 注意力机制, ViT, 视觉编码器, Qwen2.5-VL, NaViT]
+tags: [概念, 注意力机制, ViT, 视觉编码器, Qwen2.5-VL, 局部提纯]
 created: 2026-05-03
 updated: 2026-05-04
 sources: 3
@@ -11,23 +11,24 @@ status: active
 
 ## 模块整体说明与架构拆解
 
-交错窗口注意力（Interleaved Window Attention）是 Qwen2.5-VL 视觉骨干网（`Qwen2_5_VLVisionBlock`）的核心运算引擎。它主要解决了两个极限工程挑战：
-1. **算力爆炸**：大分辨率图像产生极长的 Token 序列（如 4K 图产生 10k+ Token），全量 $O(N^2)$ 注意力的计算量是模型无法承受之重。
-2. **异构隔离 (NaViT Packing)**：不同尺寸、不同归属的媒体 Patch 被“打包”在同一个长序列中，必须确保图片 A 的像素在计算时“看不见”图片 B 的像素（物理隔离）。
+交错窗口注意力（Interleaved Window Attention）是 Qwen2.5-VL 视觉骨干网（`Qwen2_5_VLVisionBlock`）的核心运算算子。它专门用于解决高分辨率图像输入下，单张图片内部 $O(N^2)$ 全局计算导致算力爆炸的问题。
+
+通过将整图的特征序列重新划分成若干个 16x16 像素（相当于 8x8 Patch）的局部“窗口”，并限定大部分网络层只在窗口内部进行注意力交互，Qwen2.5-VL 极大地降低了计算量，同时辅以少量全局层（Global Attention）来保持宏观语义。
 
 ### 内部架构流转
-在 32 层 VisionBlock 中，系统通过配置不同的“注意力视野”来实现算力与性能的平衡：
+在 32 层 VisionBlock 中，系统基于 [[packing_物理隔离机制]] 的 `cu_seqlens` 提供的大图片边界，动态切换每一层的注意力视野：
 
 ```mermaid
 graph TD
-    A["输入序列 [seq_len, 1152]"] --> B["获取元数据 grid_thw"]
-    B --> C["计算 cu_seqlens (隔离索引)"]
-    C --> D{"当前层号?"}
+    A["输入序列 & grid_thw"] --> B["获取全局隔离墙: cu_seqlens"]
+    B --> C["基于 grid_thw 计算局部窗口墙: cu_window_seqlens"]
     
-    D -->|"7, 15, 23, 31 层"| E["全局注意力 (Global Attention)\n视野: 整张图 (cu_seqlens 级别隔离)"]
-    D -->|"其余 28 层"| F["窗口注意力 (Window Attention)\n视野: 局部 16x16 窗口 (cu_window_seqlens 级别隔离)"]
+    C --> D{"当前层号配置?"}
     
-    E --> G["输出: 提纯后的视觉特征"]
+    D -->|"层 [7, 15, 23, 31]"| E["全局注意力 (Global Attention)\n计算模式: 根据 cu_seqlens 约束\n范围: 单张全图"]
+    D -->|"其余 28 层"| F["窗口注意力 (Window Attention)\n计算模式: 根据 cu_window_seqlens 约束\n范围: 图内 8x8 Patch 局部"]
+    
+    E --> G["输出提纯后的特征"]
     F --> G
     
     style E fill:#f96,stroke:#333,stroke-width:2px
@@ -35,130 +36,78 @@ graph TD
 ```
 
 ### 全局代码调用顺序与流转概览
-1. **元数据摄入**：在 `Qwen2_5_VLVisionTransformer` 顶层，根据输入 `grid_thw` 计算出全局隔离索引 `cu_seqlens`。
-2. **窗口划分**：调用 `get_window_index()`，根据物理位置将 `cu_seqlens` 进一步细拆为 `cu_window_seqlens`。
-3. **逐层分发**：遍历 32 层 Block，根据层号动态切换传入的 `cu_seqlens`。
-4. **内核执行**：进入 `Qwen2_5_VLVisionAttention.forward`，根据是否启用 Flash Attention 执行“硬件掩码”或“手动拆分”。
+1. **生成窗口隔离索引**：在进入 32 层的循环之前，模型调用 `get_window_index()`，传入 `grid_thw`，计算出 `cu_window_seqlens`。
+2. **层间动态切换**：在迭代 Block 时，通过判断当前层序号是否在 `config.fullatt_block_indexes` 中：
+    - 若在，则将 `cu_seqlens` 传给 Attention 算子。
+    - 若不在，则将 `cu_window_seqlens` 传给 Attention 算子。
+3. **计算核运行**：`Qwen2_5_VLVisionAttention` 不区分逻辑，只根据传入的 `cu_xxxx_seqlens` 去划分 Flash Attention 的计算边界。
 
 ---
 
 ## 子模块/步骤详解
 
-### 1. 步骤一：数据打包与物理隔离 (Packing & Isolation)
+### 1. 窗口切分算法 (Window Partition)
 
 #### 模块说明
-这是对 NaViT 核心思想的工程落地。为了最大化 GPU 吞吐量，Qwen2.5-VL 不对图片进行补零（Padding），而是直接将多张图的 Patch 拼接。本步骤的作用是**利用 `cu_seqlens` 建立一道数学围墙**，防止不同图片间的特征污染。
+如何在被展平的 1D 视觉序列中，根据其原始 2D 物理空间关系，抠出 8x8 Patch 的局部窗口。
 
 #### 逻辑链输入与输出
-- **逻辑链（输入）**：`grid_thw` [Num_Media, 3] (每项的 T, H, W 网格规格)。
-- **逻辑链（输出）**：`cu_seqlens` [Num_Media + 1] (累积序列偏移量)。
+- **逻辑链（输入）**：`grid_thw` [Num_Media, 3]，包含 $(T, H, W)$，也就是每张图的原始 Patch 行列分布。
+- **逻辑链（输出）**：`cu_window_seqlens`。在全图长序列中，切分出一个个 8x8 窗口对应的起始累加偏移量。
+
+#### 具体操作逻辑拆解与 Torch 对齐
+为了在不改变展平序列本质的情况下圈出 2D 窗口，系统使用了类似于给每个 Patch 发放“门牌号”（Window ID）的策略：
+1. **网格复原与门牌计算**：根据 `grid_thw` 遍历每张图片，对图中的每个 Patch $(y, x)$，计算它属于哪个窗口：
+   $$window\_id = (y // 8) \times (W // 8) + (x // 8)$$
+   （假设窗口为 8x8 Patch）。
+2. **重排与累积**：统计拥有相同 `window_id` 的 Patch 数量，并计算 `cumsum` 得到 `cu_window_seqlens`。
+
+*注：由于后续会有空间合并（PatchMerger, $2\times2$ 聚合），Qwen2.5-VL 源码中引入了 `vit_merger_window_size`。这里的 Window 并非严格的 $8\times8$，而是在合并前的逻辑空间中被巧妙组织，以确保一个窗口内的元素能完整对应下家合并逻辑的边界。*
 
 #### 第一性原理与原理解读
-*   **为什么要隔离？** 在注意力矩阵 $QK^T$ 计算中，如果不加掩码，图片 A 的 Query 会去查询图片 B 的 Key。这在物理意义上会导致模型认为两张毫不相关的图片具有因果联系，破坏特征的纯净度。
-*   **cu_seqlens 的本质 (物理围墙)**：它是一组累积坐标。它不仅隔离了不同的图片，还隔离了**同一视频的不同时间步**。
-    - **隔离逻辑**：Qwen2.5-VL 认为视觉特征提取阶段应专注于“空间提纯”。因此，哪怕是一个 100 帧的视频，在 ViT 内部也会被拆成 50 个独立的时间步，每个步（Step）只在自己内部做空间 Attention。
-    - **计算公式推导**：
-      $$cu\_seqlens = cumsum([S_1, S_1, ..., S_2, S_2, ...]) \quad \text{(其中 } S_i \text{ 为第 i 个媒体项的空间 Token 数)}$$
-      通过 `repeat_interleave(spatial_count, temporal_steps)`，系统为视频的每一个时间步都打上了一道围墙。
+*   **视野的辩证法**：为什么不全是 Window Attention？因为纯粹的窗口注意力就像一堆坐在格子间里的人，他们对格外的世界一无所知（只能识别猫毛或花纹）。而 7:1 比例加入的 Global Attention 层，打通了所有格子间的通信壁垒，将细微的纹理聚合成“猫在花丛中”的宏观概念。
+*   **解耦的精妙**：注意，Attention 算子内部本身**不知道**什么是窗口、什么是全局。它只认传入的 `cu_lengths` 偏移量数组。外部负责把 1D 数组按逻辑组装成“全局”和“窗口”的偏移数组，实现了计算与架构隔离。
 
 #### 核心源码解剖
 **代码路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
 
 ```python
-# 将 grid_thw (T, H, W) 转化为累积长度，用于 Flash Attention
-# 计算每张图的总 Patch 数: T * H * W
-# repeat_interleave 是为了处理变长序列
-cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-    0, dtype=torch.int32
+# Qwen2_5_VLVisionTransformer.forward 内部的视野切换逻辑
+cu_window_seqlens, _ = get_window_index(
+    grid_thw,
+    window_size=self.config.window_size, # 默认 112 像素
+    patch_size=self.config.patch_size,   # 默认 14 像素
+    ...
 )
-cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-```
 
----
-
-### 2. 步骤二：交错视野切换 (Window vs Global)
-
-#### 模块说明
-为了打破 $O(N^2)$ 困局，绝大多数层被限制在局部窗口（Window）内。但为了保留全局感知，每隔 8 层放开一次限制。
-
-#### 逻辑链输入与输出
-- **输入**：`seq_len = 10000`。
-- **Window (28层)**：计算量 $\approx 10000 \times 256$ (假设窗口大小 16x16)。
-- **Global (4层)**：计算量 $\approx 10000^2$ (单张图内)。
-
-#### 具体操作逻辑拆解
-1. **逻辑网格重构**：系统利用 `grid_thw` 记录的原始行列信息 $(H', W')$，将 1D 展平序列重新理解为 2D 物理平面。
-2. **窗口切分 (Window Partition)**：
-   - **窗口尺寸定义**：Qwen2.5-VL 默认 `window_size=112`，这指的是**原始图像像素**。
-   - **Patch 换算**：由于每个 Patch 为 14x14，因此 112 像素对应于 $112/14 = 8$ 个 Patch。即：Window Attention 是在 **8x8 的 Patch 窗口**内进行的。
-   - **算力对齐逻辑**：在源码实现中，为了配合后续的 `PatchMerger`（2x2 合并），系统会先将 8x8 的 Patch 窗口视为 4x4 的“元窗口”（每个元窗口包含 2x2 个 Patch），在 `get_window_index` 中体现为 `vit_merger_window_size = 4`。
-3. **cu_window_seqlens 的生成**：
-   - 它是 `cu_seqlens` 的“子集”。
-   - 系统不仅会在不同媒体项（图片/视频）间划界，还会在同一个媒体项的内部，根据窗口边界强制划界。
-   - **核心源码实现** (`get_window_index`)：
-     ```python
-     # 简化的逻辑示意
-     # 1. 确定每个 Patch 所属的窗口 ID
-     window_ids = (y // window_size) * (W // window_size) + (x // window_size)
-     # 2. 统计每个 ID 出现的次数并累加
-     cu_window_seqlens = torch.bincount(window_ids).cumsum(0)
-     ```
-4. **局部注意力**：在 Window Attention 层，Flash Attention 接收的是 `cu_window_seqlens`。这确保了 Query 只在所属的 8x8 小方块内寻找 Key/Value，计算复杂度从全图的 $O(N^2)$ 降为窗口内的常数级。
-
-#### 第一性原理与原理解读
-**视野的辩证法**：Window Attention 就像“闭门造车”，专注于打磨局部纹理（如：识别出一根猫毛）；Global Attention 就像“开门看路”，将局部的细节组合成宏观意图（如：识别出这是一只猫）。$7:1$ 的交错比例确保了模型既能看清细节，又不会迷失在局部中。
-
----
-
-### 3. 步骤三：工业级加速实现 (Flash Attention vs Manual Split)
-
-#### 模块说明
-如何让隔离（Isolation）在底层硬件上高效运行。
-
-#### 具体操作逻辑拆解与 Torch 对齐
-Qwen2.5-VL 实现了两套隔离机制：
-1. **硬件掩码 (Flash Attention)**：
-   - 直接将 `cu_seqlens` 传给 Flash Attention 内核。内核在扫描矩阵时，会自动根据这个索引截断运算。这是**零开销隔离**，性能最高。
-2. **手动拆分 (Manual Split)**：
-   - 如果显卡不支持 Flash Attention，系统会根据 `cu_seqlens` 计算出的长度，用 `torch.split` 将大管子切回成若干个小 Tensor。
-   - 对每一个小 Tensor 分别计算 Attention 后再 `torch.cat` 回去。
-
-#### 核心源码解剖
-```python
-if is_flash_attention_requested(self.config):
-    # 模式 A: 硬件高效掩码
-    attn_output, _ = attention_interface(
-        ...,
-        cu_seq_lens_q=cu_seqlens, # 传入隔离索引
-        cu_seq_lens_k=cu_seqlens,
+# 开始遍历 32 层 Block
+for i, layer_module in enumerate(self.blocks):
+    # 动态切换隔离墙
+    if i in self.config.fullatt_block_indexes:
+        # 全局层，传入基于图片/帧隔离的 cu_seqlens
+        current_cu_seqlens = cu_seqlens 
+    else:
+        # 窗口层，传入被进一步细分的 cu_window_seqlens
+        current_cu_seqlens = cu_window_seqlens 
+    
+    hidden_states = layer_module(
+        hidden_states,
+        cu_seqlens=current_cu_seqlens, # Attention 算子只管在这个区间内计算
         ...
     )
-else:
-    # 模式 B: 物理拆分隔离
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (...)]
-    attn_outputs = [attention_interface(..., q, k, v, ...) for q, k, v in zip(*splits)]
-    attn_output = torch.cat(attn_outputs, dim=1)
 ```
 
 ---
 
 ## 质量自我审查与准出标准
 
-1. **算清楚了吗？**：理解 `cu_seqlens` 的计算公式，明白为什么它是从 `grid_thw` 演化而来的。
-2. **看懂隔离了吗？**：能解释为什么图片 A 不会“看到”图片 B。
-3. **理解加速了吗？**：明白 Flash Attention 处理变长序列（Packing）的物理意义。
+1. **理清两者的关系了吗？**：理解 `cu_window_seqlens` 是对 `cu_seqlens` 在单图内部的进一步小区块细分。
+2. **算力逻辑明白了吗？**：能回答在 4K 图像上，Window Attention 是如何将 $O(N^2)$ 的复杂度降为 $O(N \cdot W^2)$ 线性复杂度的。
+3. **架构切换看懂了吗？**：知道在 `forward` 循环中，是通过 `if i in fullatt_block_indexes` 简单的切换传入变量来实现局部到全局的视界转换的。
 
 ---
 
 ## 关联概念
 
-- ✅ 支持 [[qwen2.5_vl_预处理流水线]]：提供了隔离所需的原始数据 `grid_thw`。
-- ✅ 支持 [[navit_动态分辨率]]：这是 NaViT Packing 思想在 Qwen 中的终极体现。
-- 🔄 演化自 Flash Attention 2 / Swin Transformer。
-- 下游：输出送往 [[patchmerger_空间降维]]。
-
-## 参考来源
-
-- `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
-- `knowledge_base/raw/万字长文图解Qwen2.5-VL实现细节_猛猿_2025-06-25/`
+- ✅ 依赖 [[packing_物理隔离机制]]：窗口的划分必须建立在图片与图片不相交的大前提下。
+- 🔄 演化自 Swin Transformer 的局部窗口注意力，但舍弃了 Shift 操作（通过交错 Global Attention 解决全局信息流通）。

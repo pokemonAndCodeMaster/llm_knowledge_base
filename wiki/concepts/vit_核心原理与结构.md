@@ -1,6 +1,6 @@
 ---
 title: ViT 视觉骨干网核心原理与结构
-tags: [概念, ViT, 视觉编码器, Transformer, Qwen2.5-VL, 架构统一]
+tags: [概念, ViT, 视觉编码器, Transformer, Qwen2.5-VL, 架构统一, Tensor 流转]
 created: 2026-05-03
 updated: 2026-05-04
 sources: 5
@@ -29,10 +29,10 @@ graph TD
     G --> H["输出: 深层视觉特征序列"]
 
     subgraph "单个 Block (VisionBlock) 内部核心算子"
-        N1["① RMSNorm (Pre-Norm)"] --> ATT["② Attention (Window/Global)"]
+        N1["① RMSNorm (Pre-Norm)"] --> ATT["② Attention: 跨 Patch 空间融合"]
         ATT --> ADD1["③ 残差连接 (Residual)"]
         ADD1 --> N2["④ RMSNorm"]
-        N2 --> MLP["⑤ SwiGLU MLP (bias=True)"]
+        N2 --> MLP["⑤ SwiGLU MLP: 单 Patch 内部通道提纯 (bias=True)"]
         MLP --> ADD2["⑥ 残差连接"]
     end
 ```
@@ -48,9 +48,68 @@ graph TD
 
 ## 逻辑链输入与输出
 
-- **逻辑链（输入）**：由 `patch_embed` 输出的视觉特征序列 `[TotalPatch, 1152]` (3B) 或 `[TotalPatch, 3584]` (7B)。
-- **逻辑链（输出）**：深层高级视觉语义序列 `[TotalPatch, 1152/3584]`。
+- **逻辑链（输入）**：由 `patch_embed` 输出的视觉特征序列 `[TotalPatch, 1152]` (以 3B 为例)。
+- **逻辑链（输出）**：深层高级视觉语义序列 `[TotalPatch, 1152]`。
   - **关键认知**：维度（Shape）在整个 Backbone 过程中保持不变，但向量内部的数值已经完成了从“像素感知”到“意图理解”的演化。
+
+---
+
+## 单层 Block 内部计算的微观放大镜 (Tensor Flow)
+
+许多初学者对 Transformer 内部的流转感到困惑：一个 `[TotalPatch, 1152]` 的张量是如何经过一层计算，使得每个 Patch 的特征向量中都“包含”了整张图的注意力的？
+
+我们将一层 `Qwen2_5_VLVisionBlock` 的前向计算按顺序放大拆解：
+
+### 1. Pre-Norm (RMSNorm)
+- **输入**：`X`，形状 `[TotalPatch, 1152]`。
+- **操作**：对 1152 个通道维度计算方差并进行缩放。
+- **物理意义**：把信号的尺度拉平，防止输入给后续算子的数值过大导致梯度爆炸。这是维稳的基石。👉详见 [[rmsnorm_归一化]]。
+
+### 2. 跨空间融合：多头注意力机制 (Attention)
+这是 ViT 产生“全局视野”的核心环节。
+- **操作**：
+  1. `X` 分别乘以三个权重矩阵 $W_q, W_k, W_v$，得到 $Q$（查询）、$K$（键）、$V$（值）。
+  2. 根据 [[2d_rope_视觉位置编码]]，对 $Q$ 和 $K$ 进行旋转，注入位置坐标。
+  3. **注意力矩阵计算**：$Attention = \text{Softmax}\left(\frac{Q K^T}{\sqrt{d}}\right)$。
+     - *微观解释*：假设我们关注 Patch A（比如猫的耳朵）。Patch A 的 $Q_A$ 向量会和图里所有其他 Patch 的 $K$ 向量进行点积（计算相似度）。如果 Patch B（比如猫的眼睛）和它的点积值很大，Softmax 之后 Patch A 给 Patch B 分配的权重就非常高（比如 0.8）。
+  4. **加权求和**：$Output_A = 0.8 \times V_B + 0.1 \times V_C + ...$
+- **物理意义**：**Attention 是在做跨 Patch（空间）的信息混合**。经过这一步，Patch A 原本只包含“尖尖的形状”的 1152 维向量，现在被混入了“眼睛”和“胡须”的特征，从而演化出了“猫”的初级概念。
+- **关于视频帧的注意边界**：注意，**ViT 内部的 Attention 是严格的单帧空间（Spatial）计算**。哪怕输入的是视频，[[packing_物理隔离机制]] 也会把视频的不同帧隔离成独立的图片。时间维度的融合一部分已经在上游的 Conv3D 完成（2合1），剩余的时间因果理解则交给下游的 LLM 处理。
+
+### 3. 残差连接 1 (Residual Add)
+- **操作**：`X_new = X_original + Attention_Output`。
+- **物理意义**：原始特征信号走“捷径”直接加到了融合后的特征上。防止网络太深导致最初的物理特征丢失。
+
+### 4. 单点通道过滤：非线性多层感知机 (SwiGLU)
+- **操作**：`X_new` 再次经过 RMSNorm，然后进入 SwiGLU MLP。
+  - `Up` 投影：将维度从 1152 升维到 4928。
+  - `Gate` 投影：同样的升维，但加上 Swish 激活函数。
+  - 逐元素相乘后，再通过 `Down` 投影降维回 1152。
+- **物理意义**：如果说 Attention 是不同 Patch 在互相串门，那么 **MLP 就是每个 Patch 关起门来做内部消化**。它不跨空间混合信息，只负责在这个 Patch 的 1152 维特征内部进行非线性的组合、筛选和特征放大。为了对抗传感器的物理底噪，这里的 MLP 开启了 `bias=True`。👉详见 [[swiglu_门控激活函数]]。
+
+### 5. 残差连接 2 (Residual Add)
+- **操作**：`X_final = X_new + MLP_Output`。
+- **输出**：这一层的最终结果，准备喂给下一层。
+
+---
+
+## 前向推理与反向传播 (Training vs Inference Flow)
+
+模型不仅要能正向计算，更要在训练中更新参数。
+
+### 前向推理 (Forward Pass)
+1. **Conv3D 压平**的特征流进入 ViT。
+2. 像流水线车间一样，数据依次穿过 32 层 Block。
+3. 每穿过一层，特征向量里的“语义浓度”就提高一分。
+4. 最终输出的 `[TotalPatch, 1152]` 送入 [[patchmerger_空间降维]]。
+
+### 反向传播 (Backward Pass & Gradients Flow)
+在训练阶段，当 LLM 输出最终文本并计算出 Loss（例如交叉熵损失）后：
+1. **梯度回传**：Loss 首先对 LLM 的参数求导，然后顺着网络一路反向传回 PatchMerger，最后进入 ViT 的第 32 层。
+2. **残差的“高速公路”作用**：ViT 有 32 层，如果梯度只能一层层乘过去，早就因为数值太小而消失了（梯度消失问题）。
+   - 在反向传播时，残差连接（`+` 操作）是一个**梯度分配器**（Gradient Distributor）。
+   - 它会将梯度 $100\%$ 无损地通过捷径传给上一层，同时也将梯度传给当前的 Attention 和 MLP 让它们更新权重。
+   - 这就保证了即便在第 1 层的 Conv3D，依然能收到强烈的梯度信号来指导视觉特征的提取。
 
 ---
 
@@ -113,8 +172,8 @@ class Qwen2_5_VLVisionBlock(nn.Module):
 | 组件 | 计算公式 | 参数量 (约) | 角色 |
 | :--- | :--- | :--- | :--- |
 | **RMSNorm** | $1152 \times 2$ (Block 内) | 2.3k | 稳定性锚点 |
-| **Attention** | $1152 \times 1152 \times 4$ ($Q/K/V/O$) | 5.3M | 语义融合器 |
-| **SwiGLU MLP** | $1152 \times 4928 \times 3$ (Gate/Up/Down) | 17M | 特征过滤器 |
+| **Attention** | $1152 \times 1152 \times 4$ ($Q/K/V/O$) | 5.3M | 跨空间语义融合器 |
+| **SwiGLU MLP** | $1152 \times 4928 \times 3$ (Gate/Up/Down) | 17M | 单点特征过滤器 |
 | **单层总计** | | **22.3M** | |
 | **32层总计** | $22.3M \times 32$ | **713M** | 视觉大脑主体 |
 
@@ -124,10 +183,10 @@ class Qwen2_5_VLVisionBlock(nn.Module):
 
 ## 质量自我审查与准出标准
 
-1.  **搞懂分工了吗？**：能解释为什么需要 32 层，以及 Block 7/15/23/31 为什么是特殊层（Global Attention）。
-2.  **看破 Bias 细节了吗？**：明白视觉侧 MLP 的 `bias=True` 是为了对抗物理传感器底噪，而文本端不需要（见 [[swiglu_门控激活函数]]）。
-3.  **理解架构统一了吗？**：能说出 RMSNorm 和 SwiGLU 为什么在这一代被引入。
-4.  **认清 I/O 形状了吗？**：知道 `seq_len` 在进入 `merger` 前是一直保持不变的。
+1.  **流转逻辑看懂了吗？**：必须能闭眼描述出 `[TotalPatch, 1152]` 是如何依次通过 Norm -> Attention -> Add -> Norm -> MLP -> Add 的。
+2.  **融合机制清楚了吗？**：能解释 Attention 是如何通过 $QK^T$ 让一个 Patch 获取全局（或窗口）特征的，而 MLP 只是在 Patch 内部混合通道。
+3.  **看破 Bias 细节了吗？**：明白视觉侧 MLP 的 `bias=True` 是为了对抗物理传感器底噪，而文本端不需要（见 [[swiglu_门控激活函数]]）。
+4.  **理解反向传播的高速公路了吗？**：知道在 32 层深的网络中，残差连接是如何保证梯度不消失的。
 
 ---
 

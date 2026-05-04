@@ -87,12 +87,26 @@ cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 - **Global (4层)**：计算量 $\approx 10000^2$ (单张图内)。
 
 #### 具体操作逻辑拆解
-1. **窗口重塑**：系统利用 `grid_thw` 记录的原始行列信息，将 1D 序列恢复为 3D 逻辑网格。
-2. **切分窗口**：将网格划分为互不重叠的小方块。
-3. **局部注意力**：Query 只在所属窗口的 Key/Value 中寻找相关性。
+1. **逻辑网格重构**：系统利用 `grid_thw` 记录的原始行列信息 $(H', W')$，将 1D 展平序列重新理解为 2D 物理平面。
+2. **窗口切分 (Window Partition)**：
+   - **窗口尺寸定义**：Qwen2.5-VL 默认 `window_size=112`，这指的是**原始图像像素**。
+   - **Patch 换算**：由于每个 Patch 为 14x14，因此 112 像素对应于 $112/14 = 8$ 个 Patch。即：Window Attention 是在 **8x8 的 Patch 窗口**内进行的。
+   - **算力对齐逻辑**：在源码实现中，为了配合后续的 `PatchMerger`（2x2 合并），系统会先将 8x8 的 Patch 窗口视为 4x4 的“元窗口”（每个元窗口包含 2x2 个 Patch），在 `get_window_index` 中体现为 `vit_merger_window_size = 4`。
+3. **cu_window_seqlens 的生成**：
+   - 它是 `cu_seqlens` 的“子集”。
+   - 系统不仅会在不同媒体项（图片/视频）间划界，还会在同一个媒体项的内部，根据窗口边界强制划界。
+   - **核心源码实现** (`get_window_index`)：
+     ```python
+     # 简化的逻辑示意
+     # 1. 确定每个 Patch 所属的窗口 ID
+     window_ids = (y // window_size) * (W // window_size) + (x // window_size)
+     # 2. 统计每个 ID 出现的次数并累加
+     cu_window_seqlens = torch.bincount(window_ids).cumsum(0)
+     ```
+4. **局部注意力**：在 Window Attention 层，Flash Attention 接收的是 `cu_window_seqlens`。这确保了 Query 只在所属的 8x8 小方块内寻找 Key/Value，计算复杂度从全图的 $O(N^2)$ 降为窗口内的常数级。
 
 #### 第一性原理与原理解读
-**类比**：Window Attention 就像“闭门造车”，在局部打磨细节（纹理、线条）；Global Attention 就像“开门看路”，将局部的细节组合成宏观的物体意图（这是猫、那是狗）。$7:1$ 的比例确保了模型既快又聪明。
+**视野的辩证法**：Window Attention 就像“闭门造车”，专注于打磨局部纹理（如：识别出一根猫毛）；Global Attention 就像“开门看路”，将局部的细节组合成宏观意图（如：识别出这是一只猫）。$7:1$ 的交错比例确保了模型既能看清细节，又不会迷失在局部中。
 
 ---
 

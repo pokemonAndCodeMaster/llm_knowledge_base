@@ -1,9 +1,9 @@
 ---
 title: Qwen2.5-VL 预处理流水线与异构数据大串联
-tags: [概念, 预处理, Tokenizer, 动态分辨率, 核心源码]
+tags: [概念, 预处理, Tokenizer, 动态分辨率, 核心源码, NaViT打包, cu_seqlens]
 created: 2026-05-04
 updated: 2026-05-04
-sources: 5
+sources: 6
 status: active
 ---
 
@@ -23,8 +23,9 @@ sequenceDiagram
     participant Step1 as 步骤一: 图像限界缩放 (smart_resize)
     participant Step2 as 步骤二: 视频抽帧与真实FPS (smart_nframes)
     participant Step3 as 步骤三: 时间维度对齐与同质化 (Tile/Group)
-    participant Step4 as 步骤四: 异构拼接与精准挖坑 (Concat & Tokenize)
+    participant Step4 as 步骤四: 异构展平拼接与挖坑 (Concat & Tokenize)
     participant Step5 as 步骤五: 媒体身份标识 (grid_thw)
+    participant Step6 as 步骤六: NaViT打包隔离 (cu_seqlens)
     participant LLM as LLM 视觉提取网口
     
     Raw->>Step1: 传入图像 (H, W)
@@ -39,10 +40,11 @@ sequenceDiagram
     Step3->>Step4: 同质化的 (T, H', W') 物理数据块
     
     Note over Step4: 解决多样本 Batch 并行问题<br/>切分为 14x14 Patch，暴力拉平拼接<br/>计算 Token 数量并在 Text 中插入 <|image_pad|>
-    Step4->>LLM: 输出 5D 张量 pixel_values<br/>输出文本 input_ids
-
-    Step4->>Step5: 输出 pixel_values
-    Step5->>LLM: 提供 grid_thw 身份卡
+    Step4-->>Step5: pixel_values + 每媒体的T,H',W'记录
+    Step5->>LLM: pixel_values + image/video_grid_thw
+    Step5->>Step6: grid_thw → 推算每段Patch边界
+    Note over Step6: cu_seqlens = 累积边界数组<br/>Flash Attention 用于图间物理隔离<br/>不同图的Patch永不互相Attend
+    Step6->>LLM: cu_seqlens (逐层传入ViT Attention)
 ```
 ### 全局代码调用顺序与流转概览
 为了让大家不迷失在庞杂的源码中，整个预处理流水线的入口与流转顺序如下：
@@ -224,15 +226,225 @@ def smart_nframes(ele: dict, total_frames: int, video_fps: float) -> int:
 
 ---
 
+### 步骤五：媒体身份标识与网格元数据 (grid_thw)
+
+#### 模块说明
+
+`pixel_values` 是一根无差别的超级长管子，模型本身无法判断哪段 Patch 属于哪张图/视频。`grid_thw`（Grid Temporal-Height-Width）就是每个媒体的"身份证"，记录其时间、高、宽的网格维度，供后续所有模块（注意力隔离、MRoPE、`<|image_pad|>` 挖坑数量）使用。
+
+#### 逻辑链输入与输出
+
+- **逻辑链（输入）**：经过前四步处理后，每个媒体的时间步数 $T$、空间网格行数 $H'$、空间网格列数 $W'$。
+- **逻辑链（输出）**：`image_grid_thw` / `video_grid_thw`，形状 `[N_media, 3]`，每行为 `[T, H', W']`：
+  - $T$ = 帧数 / `temporal_patch_size`（即 /2）
+  - $H'$ = 对齐后图像高度 / `patch_size`（即 /14）
+  - $W'$ = 对齐后图像宽度 / `patch_size`（即 /14）
+
+#### 具体操作逻辑拆解
+
+`grid_thw` 在 `image_processor`/`video_processor` 内部计算，由 `Processor.__call__()` 汇总输出，之后用于两处关键计算：
+
+**用途1：精确计算 `<|image_pad|>` 数量（文本挖坑）**
+
+```python
+# 代码路径：processing_qwen2_5_vl.py，约第 120 行
+merge_length = self.image_processor.merge_size ** 2  # = 2^2 = 4
+index = 0
+for i in range(len(text)):
+    while self.image_token in text[i]:
+        # grid_thw[index].prod() = T × H' × W' = 该媒体总Patch数
+        num_image_tokens = image_grid_thw[index].prod() // merge_length
+        # 除以4是因为 PatchMerger 会把2×2个Patch合并为1个Token
+        text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens, 1)
+        index += 1
+```
+
+**用途2：计算 MRoPE 三维位置 ID**
+
+`get_rope_index()` 遍历 `grid_thw`，为每个 Patch 分配 `(t, h, w)` 三元组坐标，详见 [[mrope_多模态位置编码]]。
+
+#### 公式推导与张量跟踪
+
+| 媒体 | T | H' | W' | grid_thw行 | 总Patch数 | LLM Token数 |
+|------|---|----|----|-----------|----------|------------|
+| Picture 1 (8204×1092) | 1 | 586 | 78 | `[1,586,78]` | 45708 | 11427 |
+| Picture 2 (28×224) | 1 | 2 | 16 | `[1,2,16]` | 32 | 8 |
+| Video 1 (392×644, 4帧) | 2 | 28 | 46 | `[2,28,46]` | 2576 | 644 |
+
+```python
+# 实际输出示例
+image_grid_thw = torch.tensor([
+    [1, 586, 78],  # Picture 1
+    [1,   2, 16],  # Picture 2
+])
+video_grid_thw = torch.tensor([
+    [2,  28, 46],  # Video 1
+])
+```
+
+---
+
+### 步骤六：NaViT 打包隔离与掩码注意力 (cu_seqlens)
+
+#### 模块说明
+
+这是整个流水线最容易被忽略、但极其关键的一步。`pixel_values` 把所有 Patch 无差别地拼在一起（NaViT Packing 思想）。如果 ViT 的 Attention 直接对整根管子计算，图片 A 的像素就会"看到"图片 B 的像素，产生**特征污染**。`cu_seqlens`（Cumulative Sequence Lengths，累积序列长度）是解决这个问题的隔离屏障。
+
+**核心认知三层递进**：
+
+| 层次 | 问题 | 方案 |
+|------|------|------|
+| Packing（打包）| 为什么把不同图拼成一根管子？ | 节省显存，消除 Padding，最大化 GPU 利用率 |
+| Isolation（隔离）| 管子里不同图的 Patch 为何不能互相 Attend？ | 防止特征污染，保证语义纯洁性 |
+| Coordinate（坐标）| 如何标记哪段属于哪张图？ | `grid_thw` → 计算 `cu_seqlens` 边界数组 |
+
+#### 逻辑链输入与输出
+
+- **逻辑链（输入）**：步骤五产出的 `grid_thw`，形状 `[N_media, 3]`。
+- **逻辑链（输出）**：`cu_seqlens`，形状 `[N_time_steps + 1]`，记录每个时间步在长管子中的累积结束位置（首元素恒为 0）。
+
+#### 具体操作逻辑拆解
+
+**cu_seqlens 的生成**（`modeling_qwen2_5_vl.py`，`Qwen2_5_VisionTransformerPretrainedModel.forward()`，约第 488 行）：
+
+```python
+# grid_thw shape: [N_media, 3]，每行 [T, H', W']
+
+# 步骤1: 计算每个时间步的Patch数，并按T展开
+# repeat_interleave: 若某媒体 T=2，则 H'×W' 重复2次
+cu_seqlens = torch.repeat_interleave(
+    grid_thw[:, 1] * grid_thw[:, 2],  # 每个媒体单个时间步的Patch数 = H'×W'
+    grid_thw[:, 0]                    # 按时间步数T重复
+).cumsum(dim=0, dtype=torch.int32)   # 步骤2: 累积求和
+
+# 步骤3: 在头部补 0，形成完整边界数组 [0, end_1, end_2, ...]
+cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+```
+
+**具体数值示例**：
+
+```
+# 以图像为例: image_grid_thw = [[1, 586, 78], [1, 2, 16]]
+# 步骤1: repeat_interleave
+#   Picture 1: H'×W' = 586×78 = 45708, T=1 → 出现1次 → [45708]
+#   Picture 2: H'×W' = 2×16 = 32,      T=1 → 出现1次 → [32]
+#   patch_counts_per_timestep = [45708, 32]
+# 步骤2: cumsum → [45708, 45740]
+# 步骤3: pad  → [0, 45708, 45740]
+# 含义：
+#   管子[0:45708]     → Picture 1 的全部Patch
+#   管子[45708:45740] → Picture 2 的全部Patch
+
+# 以视频为例: video_grid_thw = [[2, 28, 46]]
+# 步骤1: repeat_interleave
+#   Video 1: H'×W' = 28×46 = 1288, T=2 → 出现2次 → [1288, 1288]
+# 步骤2: cumsum → [1288, 2576]
+# 步骤3: pad  → [0, 1288, 2576]
+# 含义：
+#   管子[0:1288]    → Video 1 第1个时间步（帧1-2的Patch）
+#   管子[1288:2576] → Video 1 第2个时间步（帧3-4的Patch）
+```
+
+#### cu_seqlens 在 ViT Attention 中的使用
+
+`cu_seqlens` 被逐层传入 `Qwen2_5_VLVisionBlock`，在 `Qwen2_5_VLVisionAttention.forward()` 中被消费：
+
+**路径 A：Flash Attention（主路径，高效）**
+
+```python
+# 文件：modeling_qwen2_5_vl.py，约第 244 行
+if is_flash_attention_requested(self.config):
+    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    attn_output, _ = attention_interface(
+        self,
+        query_states, key_states, value_states,
+        attention_mask=None,
+        cu_seq_lens_q=cu_seqlens,  # ← 告知FA每段的起止边界
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max_seqlen,
+        max_length_k=max_seqlen,
+        is_causal=False,
+    )
+    # Flash Attention 内核根据 cu_seqlens 自动屏蔽跨段 Attention
+    # 图片A的Patch永远不会attend到图片B的Patch ✅
+```
+
+**路径 B：降级方案（无 Flash Attention 时）**
+
+```python
+else:
+    # 没有高效掩码内核，手动 split 物理隔离，宁可牺牲并行也不混淆
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]  # 每段长度
+    splits = [
+        torch.split(tensor, lengths.tolist(), dim=2)
+        for tensor in (query_states, key_states, value_states)
+    ]
+    attn_outputs = [
+        attention_interface(self, q, k, v, ...)[0]
+        for q, k, v in zip(*splits)  # 每张图独立计算Attention
+    ]
+    attn_output = torch.cat(attn_outputs, dim=1)  # 拼回长管子
+```
+
+> 两条路径的**语义完全相同**：图片 A 的像素永远不会 attend 到图片 B 的像素。Flash Attention 用内核级掩码高效实现；降级方案用物理 split 实现，以牺牲并行换正确性。
+
+#### Window Attention 与 Full Attention 的双重 cu_seqlens
+
+Qwen2.5-VL 的 ViT 层混合了 Window Attention（大多数层）和 Full Attention（少数指定层）。两种注意力使用不同粒度的隔离边界：
+
+```python
+# 代码：modeling_qwen2_5_vl.py，约第 498 行
+for layer_num, blk in enumerate(self.blocks):
+    if layer_num in self.fullatt_block_indexes:
+        cu_seqlens_now = cu_seqlens        # 以媒体为单位（图级隔离）
+    else:
+        cu_seqlens_now = cu_window_seqlens  # 以窗口为单位（更细粒度）
+    hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens_now, ...)
+```
+
+`cu_window_seqlens` 由 `get_window_index()` 计算，在媒体级别隔离的基础上，进一步按配置的空间窗口大小（`window_size`）划分子区域，详见 [[window_attention_交错注意力]]。
+
+#### 关于"掩码池化（Masked Pooling）"的变通
+
+原始 NaViT 需要掩码池化将变长序列聚合为定长特征向量（用于分类）。Qwen2.5-VL **不需要全局池化**，需要的是保留空间细节的 Patch 序列。其变通方案：
+
+1. **`PatchMerger` 替代掩码池化**：以 2×2 局部合并替代全局池化，将 Patch 数降为 1/4，同时保留空间结构（见 [[patchmerger_空间降维]]）。
+2. **`grid_thw` 用于事后定位边界**：PatchMerger 输出后，下游通过 `grid_thw` 记录的 T/H'/W' 信息，可以重新定位每个媒体的边界进行逻辑隔离。
+
+---
+
 ## 可训练参数与网络状态
-整个预处理流水线是纯物理切分与张量重塑。
-**可训练参数**：**0**。不属于神经网络。
+
+整个预处理流水线（步骤一至六）是纯物理切分与张量重塑，**不包含任何可训练参数**（`cu_seqlens` 是纯数学推导，不参与梯度传播）。
+
+**可训练参数**：**0**。
+
+---
+
+## 版本演化对比
+
+| 特性 | Qwen2-VL | Qwen2.5-VL |
+|------|---------|------------|
+| 动态分辨率基础 | smart_resize (factor=28) | 同上（沿用） |
+| NaViT Packing | ✅ 支持 | ✅ 支持 |
+| 掩码注意力实现 | cu_seqlens (Flash Attn) | cu_seqlens + cu_window_seqlens（新增 Window Attn 混合） |
+| Token Drop 策略 | ❌ 无（全量等比 Resize） | ❌ 无（全量等比 Resize） |
+| grid_thw 结构 | [N, 3] | [N, 3]（沿用） |
+| 帧复制（图像入 Conv3D）| ✅ 1帧→2帧 Tile | ✅ 同上 |
+
+---
 
 ## 关联概念
-- [[navit_动态分辨率]]：原生动态分辨率的理念起源。
-- [[conv3d_时空切块器]]：接住预处理大管子输出的第一个含可训练参数的实体物理网络。
-- [[mrope_多模态位置编码]]：依赖预处理中步骤二算出的 `sample_fps`，完成绝对时间的同步刻印。
+
+- 🔄 演化自 [[navit_动态分辨率]]：NaViT 的 Packing 思想是步骤四（Concat）和步骤六（cu_seqlens 图间隔离）的直接来源。
+- [[conv3d_时空切块器]]：接住预处理大管子输出的第一个含可训练参数的实体物理网络，`pixel_values [N_patch,3,2,14,14]` 是其输入。
+- [[mrope_多模态位置编码]]：依赖步骤二算出的 `sample_fps` 和步骤五的 `grid_thw`，完成绝对时间与空间坐标的刻印。
+- [[patchmerger_空间降维]]：NaViT 掩码池化的变通方案，用 2×2 局部合并将 Token 数压缩为 1/4，同时保留空间结构。
+- [[window_attention_交错注意力]]：`cu_window_seqlens` 提供 Window Attention 层内更细粒度的空间隔离边界。
 
 ## 参考来源
+
 - `knowledge_base/raw/万字长文图解Qwen2.5-VL实现细节_猛猿_2025-06-25/index.md`
 - `knowledge_base/raw/[qwen2vl-internvl2.5] 动态分辨率输入方案解读_梦想成真_2025-03-11/index.md`
+- 源码：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`（`Qwen2_5_VisionTransformerPretrainedModel.forward`，约 488 行；`Qwen2_5_VLVisionAttention.forward`，约 244 行）
+- 源码：`transformers/src/transformers/models/qwen2_5_vl/processing_qwen2_5_vl.py`（`Qwen2_5_VLProcessor.__call__`，约 124 行）

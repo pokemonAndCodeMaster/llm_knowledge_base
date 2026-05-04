@@ -26,6 +26,9 @@ PatchMerger（全称 `Qwen2_5_VLPatchMerger`）是 Qwen 系列多模态模型中
 - **逻辑链（输入）**：ViT 最后一层输出 `[seq_len, 1152]`。
 - **逻辑链（输出）**：降维并对齐维度后的超级视觉 Token `[seq_len / 4, 4096]`。
 
+**PatchMerger 原理示意图**：
+![PatchMerger Illustration](../assets/qwen25_vl/v2-1f708b3a85f0cd60557f2e7477270cd5_r.jpg)
+
 ---
 
 ## 核心算法原理详解

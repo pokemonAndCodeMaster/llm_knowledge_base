@@ -65,6 +65,9 @@ freqs = concat(freqs_T, freqs_H, freqs_W)  # 拼接：[Batch, Seq_len, 64]
 
 ### 3. 三种输入类型的位置 ID 分配
 
+**核心逻辑图示**（时间步在不同视频帧间递增）：
+![MRoPE Illustration](../assets/qwen25_vl/v2-e6d08c686a68fb25fb3be108a9c6c4e1_r.jpg)
+
 **纯文本**：三个维度使用**相同的位置 ID**，等价于 1D-RoPE。
 ```
 text:  T=[101, 102, 103], H=[101, 102, 103], W=[101, 102, 103]
@@ -81,7 +84,12 @@ image: T=[0, 0, 0, 0], H=[0, 0, 1, 1], W=[0, 1, 0, 1]
 
 **来龙去脉**：在 Qwen2-VL 的 naive MRoPE 中，视频的时间 ID 只是简单递增（0, 1, 2, 3...），不反映真实的物理时间间隔。一个 2fps 的视频和一个 30fps 的视频，同样的 4 帧，时间 ID 都是 0-3，但前者跨越了 2 秒，后者只跨越了 0.13 秒。模型无法区分这种时间尺度差异。
 
-**Qwen2.5-VL 的突破**：MRoPE 的 Temporal 维度对齐了物理时间（秒）。核心公式：
+**Qwen2.5-VL 的突破**：MRoPE 的 Temporal 维度对齐了物理时间（秒）。
+
+**时间序列映射示意图**：
+![MRoPE Sequence](../assets/qwen25_vl/v2-086d610a300f59b3257bf1ff71829359_r.jpg)
+
+核心公式：
 
 $$interval = tokens\_per\_second \times \frac{temporal\_patch\_size}{fps}$$
 

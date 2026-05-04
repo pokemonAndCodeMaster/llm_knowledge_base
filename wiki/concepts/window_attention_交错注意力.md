@@ -49,6 +49,11 @@ fullatt_block_indexes = list(range(7, 32, 8))  # [7, 15, 23, 31]
 
 **Step 2**：在每个窗口内独立进行 Self-Attention 计算。窗口之间完全隔离。
 
+**Window Attention 与 Patch 排布重塑示意图**：
+![Window Attention](../assets/qwen25_vl/v2-285daabd1a4a0e9563997736a416abad_r.jpg)
+由于进入 ViT 之前，底层流水线是将 $2 \times 2$ 的区域转为 1 个超级 Token 的排布，所以在实际做窗口切分时，需要做一系列维度重排（Reshape）：
+![Patch Arrangement](../assets/qwen25_vl/v2-a635f83d96f40ad6df357485cf26f9ba_r.jpg)
+
 **Step 3**：窗口内的 Self-Attention 计算与标准 Attention 完全相同：
 $$Attention(Q, K, V) = softmax\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
 

@@ -6,6 +6,7 @@
       {
         "id": "17e698e74a81b20f",
         "type": "tabs",
+        "dimension": 78.19148936170212,
         "children": [
           {
             "id": "9302c91d703bed29",
@@ -14,12 +15,92 @@
               "type": "markdown",
               "state": {
                 "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
-                "mode": "source",
+                "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
               "title": "qwen2.5_vl_深度剖析学习指南"
+            },
+            "group": "1154cc387bb7f1f5"
+          },
+          {
+            "id": "acd7f854558bd23e",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "concepts/qwen2.5_vl_预处理流水线.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "qwen2.5_vl_预处理流水线"
             }
+          },
+          {
+            "id": "cf6ea89c1ab57043",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "concepts/qwen2.5_vl_预处理流水线.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "qwen2.5_vl_预处理流水线"
+            }
+          },
+          {
+            "id": "cd481ba3e8ff035f",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "concepts/conv3d_时空切块器.md",
+                "mode": "preview",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "conv3d_时空切块器"
+            }
+          },
+          {
+            "id": "d74bdb0950c6bf4c",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "concepts/vit_核心原理与结构.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "vit_核心原理与结构"
+            }
+          }
+        ]
+      },
+      {
+        "id": "12d31c36ae59c255",
+        "type": "tabs",
+        "dimension": 21.808510638297875,
+        "children": [
+          {
+            "id": "1460a4ca2def1403",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "qwen2.5_vl_深度剖析学习指南 的大纲"
+            },
+            "group": "1154cc387bb7f1f5"
           }
         ]
       }
@@ -173,6 +254,14 @@
   "lastOpenFiles": [
     "concepts/qwen2.5_vl_预处理流水线.md",
     "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+    "concepts/conv3d_时空切块器.md",
+    "concepts/vit_核心原理与结构.md",
+    "concepts/window_attention_交错注意力.md",
+    "concepts/qwen2.5_vl_三阶段预训练.md",
+    "concepts/navit_动态分辨率.md",
+    "concepts/2d_rope_视觉位置编码.md",
+    "concepts/qwen2.5_vl_预处理框架集成与显存评估.md",
+    "concepts/rmsnorm_归一化.md",
     "未命名.md",
     "Untitled Diagram 1.svg",
     "log.md",
@@ -180,9 +269,6 @@
     "synthesis/images/qwen2.5_vl_module0_processor.png",
     "Untitled Diagram.svg",
     "synthesis/images/qwen2.5_vl_full_architecture.png",
-    "concepts/navit_动态分辨率.md",
-    "concepts/vit_核心原理与结构.md",
-    "concepts/conv3d_时空切块器.md",
     "concepts/mrope_多模态位置编码.md",
     "assets/qwen25_vl/NaViT-截屏2025-03-27 19.27.30.png",
     "assets/qwen25_vl/NaViT-截屏2025-03-27 19.18.59.png",
@@ -193,7 +279,6 @@
     "assets/qwen25_vl",
     "assets",
     "synthesis/_fix_guide.py",
-    "concepts/2d_rope_视觉位置编码.md",
     "sources/qwen2.5_vl_技术报告解析.md"
   ]
 }

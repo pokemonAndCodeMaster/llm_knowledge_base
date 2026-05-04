@@ -1,133 +1,109 @@
 ---
 title: RMSNorm 归一化
-tags: [概念, 归一化, Transformer, Qwen2.5-VL]
+tags: [概念, 归一化, Transformer, Qwen2.5-VL, LLM]
 created: 2026-05-03
-updated: 2026-05-03
-sources: 3
+updated: 2026-05-04
+sources: 2
 status: active
 ---
 
 # RMSNorm 归一化
 
-## 模块整体说明
+## 模块整体说明与架构拆解
 
-RMSNorm (Root Mean Square Layer Normalization) 是 Qwen2.5-VL 中全面采用的归一化方案，用于替代传统的 LayerNorm。它出现在 ViT 的每一个 VisionBlock（`norm1`, `norm2`）和 [[patchmerger_空间降维]] 的归一化层中。
+RMSNorm（Root Mean Square Layer Normalization）是 Qwen2.5-VL 中**视觉编码器与语言基座共用**的标准化机制。它是一种计算效率更高的 LayerNorm 变体。
 
-**它解决的核心问题**：Transformer 在训练过程中，隐藏层的激活值分布会不断漂移，导致梯度消失或爆炸。归一化通过强制将分布拉回标准范围来解决这个问题。
+### 为什么需要归一化？
+在深度神经网络中，每一层的输出都会作为下一层的输入。随着层数加深，梯度的微小波动会被不断放大（梯度爆炸）或缩小（梯度消失）。归一化通过将张量数值映射到一个稳定的分布，确保模型训练的数值稳定性。
 
-**直观比喻**：想象一群学生的考试成绩（激活值）。LayerNorm 是先算平均分和标准差，然后把每个人的成绩转化为"偏离平均多少个标准差"。RMSNorm 则简化了——不算平均分，只算"均方根"（一个衡量整体成绩大小的指标），然后把每个人的成绩除以这个值。省去了求平均的步骤，速度更快。
+### 内部架构流转
+在 `Qwen2_5_VLVisionBlock` 中，RMSNorm 采用 **Pre-Norm** 结构：
+
+```mermaid
+graph LR
+    A["输入 hidden_states"] --> B["RMSNorm (norm1/norm2)"]
+    B --> C["注意力层 / MLP层"]
+    C --> D["残差连接: + 输入"]
+    D --> E["下一层输入"]
+```
 
 ---
 
 ## 逻辑链输入与输出
 
-- **逻辑链（输入）**：`[seq_len, hidden_size]` 的特征张量。
-- **逻辑链（输出）**：同维度 `[seq_len, hidden_size]`，分布被标准化。
+- **逻辑链（输入）**：`hidden_states` [seq_len, hidden_size] (例如 [N, 1152])。
+- **逻辑链（输出）**：归一化后的 `hidden_states` [seq_len, hidden_size]。
 
 ---
 
 ## 核心算法原理详解
 
-### 1. 传统 LayerNorm vs RMSNorm
+### 1. 从 LayerNorm 到 RMSNorm (第一性原理)
 
-**LayerNorm**（Qwen2-VL 中使用）：
-$$LayerNorm(x) = \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} \cdot \gamma + \beta$$
-需要计算均值 $\mu$ 和方差 $\sigma^2$，以及两个可学习参数 $\gamma$（缩放）和 $\beta$（偏移）。
+**传统 LayerNorm**：
+它通过减去均值（Mean）并除以标准差来对齐分布。它的公式包含两个统计量：
+$$y = \frac{x - E[x]}{\sqrt{Var[x] + \epsilon}} \times \gamma + \beta$$
+- $E[x]$：均值对齐（平移）
+- $Var[x]$：方差对齐（缩放）
 
-**RMSNorm**（Qwen2.5-VL 中使用）：
-$$RMSNorm(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}} \cdot w$$
+**RMSNorm 的革新**：
+研究表明，LayerNorm 的效果主要来自于**缩放（Scaling）**而非平移。RMSNorm 抛弃了均值计算，只计算均方根（Root Mean Square）：
+$$RMS(x) = \sqrt{\frac{1}{n} \sum_{i=1}^{n} x_i^2}$$
+$$y = \frac{x}{RMS(x) + \epsilon} \times \gamma$$
 
-- 省去了均值的计算（$\mu$），直接用均方根。
-- 省去了偏移参数（$\beta$），只保留缩放参数 $w$。
-- $w$ 初始化为全 **1**（恒等映射）。
-
-**为什么可以省去均值？** 论文（Zhang & Sennrich, 2019）发现，LayerNorm 的性能主要来自缩放不变性（除以方差），而不是平移不变性（减去均值）。去掉均值后，计算量减少约 10%，且性能几乎无损。
-
-### 2. 数值计算示例
-
-假设 `hidden_size = 4`，输入向量 $x = [2.0, -1.0, 0.5, 1.5]$：
-
-```
-Step 1: 计算均方 (mean of squares)
-  x² = [4.0, 1.0, 0.25, 2.25]
-  mean(x²) = (4.0 + 1.0 + 0.25 + 2.25) / 4 = 1.875
-
-Step 2: 计算均方根 (RMS)
-  RMS = √(1.875 + 1e-6) ≈ 1.3693
-
-Step 3: 除以 RMS
-  x_norm = [2.0/1.3693, -1.0/1.3693, 0.5/1.3693, 1.5/1.3693]
-         = [1.4606, -0.7303, 0.3651, 1.0954]
-
-Step 4: 乘以可学习权重 w（初始全为 1）
-  output = w * x_norm = [1.4606, -0.7303, 0.3651, 1.0954]
-```
-
-### 可训练参数与训练方式
-
-- **网络结构**：一个 `nn.Parameter`，形状为 `(hidden_size,)`。
-- **初始化**：全部为 **1**（`torch.ones(hidden_size)`）。
-- **训练状态**：随所在模块一起训练。在 ViT 中，Stage 1-3 可训练，后训练冻结。
+**优点**：
+1. **计算更省**：不需要计算均值，减少了加法和减法操作。
+2. **不变性**：具备重缩放不变性（Re-scaling Invariance）。
+3. **主流标准**：已成为 LLaMA、Qwen 等顶流多模态模型的标配。
 
 ---
 
-## 源码逐行解剖
+## 核心源码解剖
 
 **代码路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
 
 ```python
 class Qwen2_5_VLRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         super().__init__()
-        # 可学习缩放权重，初始化为全 1
+        # 唯一的可训练参数：缩放权重 gamma
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)  # 升精度防止溢出
-
-        # 核心：计算均方，求倒数平方根
+        # 为了数值精度，强制转为 float32 计算
+        hidden_states = hidden_states.to(torch.float32)
+        # 计算均方根 (x^2 的均值)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # 归一化核心逻辑
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        # 乘以可学习权重
+        # 应用可训练的 gamma 缩放并转回原精度
         return self.weight * hidden_states.to(input_dtype)
 ```
 
 ---
 
-## 后续演进：Zero-Centered RMSNorm
+## 参数生命周期与渊源追溯
 
-在 Qwen3-Next 和 Qwen3.5 中，RMSNorm 进一步演化为 **Zero-Centered RMSNorm**：
-
-$$ZeroCentered\_RMSNorm(x) = \frac{x}{\sqrt{\frac{1}{d}\sum x_i^2 + \epsilon}} \cdot (1 + w)$$
-
-- 权重 $w$ 初始化为全 **0**（而非全 1）。
-- 计算时乘以 $(1 + w)$，初始时等价于恒等映射。
-- **架构意义**：初始时分布严格约束在零中心，极大缓解了混合注意力（特别是 Linear Attention 的 Q/K 归一化）中的数值不稳定。
-
----
-
-## 版本演化对比
-
-| 版本 | 归一化 | 权重初始值 | 计算公式 |
-|------|--------|-----------|---------|
-| Qwen2-VL ViT | LayerNorm | γ=1, β=0 | $(x-\mu)/\sigma \cdot \gamma + \beta$ |
-| **Qwen2.5-VL ViT** | **RMSNorm** | **w=1** | $x/RMS \cdot w$ |
-| Qwen3-VL ViT | LayerNorm (回退) | γ=1, β=0 | 因 DeepStack 需要均值去中心化 |
-| Qwen3.5 LLM | **Zero-Centered RMSNorm** | **w=0** | $x/RMS \cdot (1+w)$ |
+- **网络结构**：纯数学变换 + 单层可训练权重 `self.weight`。
+- **参数量**：在 ViT 中为 1152 个参数；在 LLM 中为 4096 个参数。
+- **演化追溯**：
+  - Qwen2-VL 的视觉侧使用的是传统的 `LayerNorm`。
+  - **Qwen2.5-VL 实现了“架构统一”**：将视觉侧的归一化全部升级为 `RMSNorm`，使其在数学性质上更接近 LLM 基座，有助于跨模态特征的顺滑对齐。
+- **生命周期追踪**：
+  - **训练阶段**：解冻，参与视觉语义的提纯。
+  - **SFT阶段**：随 ViT 整体冻结。
 
 ---
 
 ## 关联概念
 
-- ✅ 支持 [[qwen2.5_vl_技术报告解析]]：ViT 归一化从 LayerNorm 升级为 RMSNorm 是架构向 LLM 靠拢的标志。
-- 与 [[swiglu_门控激活函数]] 配合使用于 VisionBlock 中（Pre-Norm 架构）。
-- 与 [[window_attention_交错注意力]] 组成 VisionBlock 的完整结构。
-- 在 [[patchmerger_空间降维]] 中用作归一化层（`ln_q`）。
+- ✅ 支持 [[window_attention_交错注意力]]：在 Attention 计算前进行 Pre-Norm。
+- ✅ 支持 [[swiglu_门控激活函数]]：在 MLP 计算前进行 Pre-Norm。
+- 🔄 演化自 T5 模型中的 LayerNorm 简化版。
 
 ## 参考来源
 
-- 原始资料：`knowledge_base/Qwen2.5-VL/Qwen2.5-VL.md`
-- 前置知识：`qwen_learning_guide_phase0.md` §3 归一化
+- `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+- `knowledge_base/raw/面试官!从Qwen-VL到Qwen3.5技术改进？(26年2月版)/面试官!从Qwen-VL到Qwen3.5技术改进？(26年2月版) .md`

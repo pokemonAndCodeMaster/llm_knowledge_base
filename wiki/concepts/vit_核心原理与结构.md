@@ -1,68 +1,116 @@
 ---
-title: Vision Transformer (ViT) 核心原理与第一性解剖
-tags: [概念, 视觉编码器, ViT, Transformer, 基础原理]
-created: 2026-05-04
+title: ViT 视觉骨干网核心原理与结构
+tags: [概念, ViT, 视觉编码器, Transformer, Qwen2.5-VL]
+created: 2026-05-03
 updated: 2026-05-04
-sources: 0
+sources: 4
 status: active
 ---
 
-# Vision Transformer (ViT) 核心原理与第一性解剖
+# ViT 视觉骨干网核心原理与结构
 
-## 模块整体说明
-Vision Transformer（ViT）是打破 CNN 在计算机视觉领域统治地位的革命性架构。它将图像切分为块（Patch），拉平为序列，然后完全套用自然语言处理（NLP）中的 Transformer 架构来处理视觉任务。
+## 模块整体说明与架构拆解
 
-**在 Qwen 系列中的地位**：Qwen2.5-VL 并没有直接使用开源的 CLIP ViT，而是**从头预训练了一个 675M 参数量**的定制版 ViT（结合了 NaViT 动态分辨率与 2D-RoPE）。它的职责是充当**高级视觉中枢**，把底层像素升级为蕴含高阶语义（如物体、场景、上下文关系）的深层特征。
+视觉骨干网（Vision Backbone）是 Qwen2.5-VL 的“语义加工厂”。它的职责是接住 [[conv3d_时空切块器]] 输出的粗糙局部特征，通过多层 Transformer Block 的深度堆叠，实现从“局部像素块”到“全局语义概念”的华丽蜕变。
+
+### 内部架构流转
+Qwen2.5-VL 的视觉侧采用了一个深达 **32 层** 的 Transformer 结构：
+
+```mermaid
+graph TD
+    A["输入序列 [seq_len, 1152]"] --> B["Block 1: RMSNorm + Window Attention + MLP"]
+    B --> C["Block 2...31"]
+    C --> D["Block 32: RMSNorm + Global Attention + MLP"]
+    D --> E["输出深层特征 [seq_len, 1152]"]
+    
+    subgraph "单个 Block 内部"
+        N1["RMSNorm (Pre-Norm)"] --> ATT["Attention (Window/Global)"]
+        ATT --> ADD1["残差连接"]
+        ADD1 --> N2["RMSNorm"]
+        N2 --> MLP["SwiGLU MLP (bias=True)"]
+        MLP --> ADD2["残差连接"]
+    end
+```
+
+---
+
+## 逻辑链输入与输出
+
+- **逻辑链（输入）**：拉平的视觉序列 `[seq_len_vision, 1152]`。
+- **逻辑链（输出）**：深层高级视觉语义序列 `[seq_len_vision, 1152]`。
 
 ---
 
-## 破除黑盒：为什么需要多层 Transformer？
+## 核心算法原理详解
 
-**前置问题：既然 Transformer 不改变张量的形状维度（输入 `[seq, 1152]` 输出也是 `[seq, 1152]`），那么直接在输入层疯狂训练 Embedding 行不行？**
+### 1. 为什么需要多层堆叠？ (第一性原理)
 
-**答案：绝对不行。**
+**黑盒破除**：虽然 Transformer 每一层的输入输出维度都是 1152，但其语义密度（Information Density）是完全不同的。
+- **浅层 (Layer 1-8)**：主要提取线条、色彩斑块、简单的几何形状。此时模型还在“看”细节。
+- **中层 (Layer 9-24)**：开始将细节组合成局部物体部件（如猫的耳朵、汽车的轮子）。
+- **深层 (Layer 25-32)**：形成宏观的语义抽象（如“这是一只正在睡觉的猫”）。
+- **结论**：**堆叠的深度决定了模型对视觉场景理解的“深度”和“抽象层次”**。
 
-1. **Embedding 的局限性（管中窥豹）**：
-   - 视觉的 Embedding 层（如 Qwen 的 [[conv3d_时空切块器]]）的本质是物理滤波器。由于它的感受野只有 $14 \times 14$ 像素，不管你怎么训练，一个切分到“狗尾巴”的 Patch，永远只能看出“这是毛发”，**它绝不可能知道画面另一头有一根牵着狗的绳子**。
-2. **多层 Transformer 的真正作用（全局串联）**：
-   - Transformer 的作用**不在于改变维度，而在于特征内的信息融合**。
-   - 每经过一层 Transformer 的 Self-Attention，每个 Patch 都会向所有其他 Patch “询问”并收集信息。
-   - **浅层提取什么**：浅层（前几层）主要聚合相邻 Patch 的边缘、纹理，拼接出局部轮廓（如“这是一个圆形的边缘”）。
-   - **深层提取什么**：深层（后几层）经过几十次的全局信息广播，一个局部的 Patch 已经融合了整张图的上下文（如“这个圆形边缘，结合了周围的狗身子和远处的草地，其实是一只狗的头”）。深层特征脱离了底层的物理像素，变成了**高阶的抽象语义**。这就是大模型能理解“场景意图”的原因。
+### 2. 架构统一：视觉与语言的“同质化”
+
+Qwen2.5-VL 相比 Qwen2-VL 的最大改进在于**将视觉侧的组件彻底 LLM 化**：
+- **归一化**：LayerNorm $\rightarrow$ [[rmsnorm_归一化]]
+- **前馈网络**：GELU MLP $\rightarrow$ [[swiglu_门控激活函数]]
+- **算力优化**：Full Attention $\rightarrow$ [[window_attention_交错注意力]]
+
+**意义**：这种“架构统一”让视觉特征在进入 LLM 之前，其分布特性已经非常接近词向量，极大降低了跨模态对齐的难度。
+
+---
+
+## 核心源码解剖
+
+**代码路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+
+```python
+class Qwen2_5_VLVisionTransformer(Qwen2_5_VisionTransformerPretrainedModel):
+    def __init__(self, config: Qwen2_5_VLVisionConfig):
+        super().__init__(config)
+        # 1. 物理入口
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+            patch_size=config.patch_size,
+            temporal_patch_size=config.temporal_patch_size,
+            in_channels=config.in_channels,
+            embed_dim=config.hidden_size,
+        )
+        # 2. 位置感知
+        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(config.hidden_size // config.num_heads)
+        
+        # 3. 32层深度堆叠
+        self.blocks = nn.ModuleList(
+            [Qwen2_5_VLVisionBlock(config) for _ in range(config.num_hidden_layers)]
+        )
+        
+        # 4. 空间降维桥接器 (下个模块详解)
+        self.merger = Qwen2_5_VLPatchMerger(
+            dim=config.hidden_size, context_dim=config.hidden_size, spatial_merge_size=2
+        )
+```
 
 ---
 
-## ViT 组件的第一性原理解剖
+## 演化与对比：Qwen2.5-VL vs Qwen3-VL
 
-Qwen2.5-VL 对传统 ViT 做了深度改造，使其更像现代的 LLM。我们来逐一拆解这些基础组件在视觉信号处理中的真实用途。
-
-### 1. 交错窗口注意力 (Interleaved Window Attention)
-**组件职责**：让 Token 互相交流，计算相关性。
-**为什么需要 Window Attention？**
-- 传统 ViT 的全局 Attention 计算复杂度是 $O(N^2)$（$N$ 是 Patch 数量）。在 Qwen2.5-VL 的动态分辨率下，$N$ 可能高达数万（如长图），全局 Attention 会瞬间耗尽显存。
-- **物理原理**：图像的空间冗余度极高。很多时候，理解一个物体的局部细节并不需要看全图。因此，模型将整图划分为最大 $112 \times 112$ 的窗口，**平时只在窗口内做互相 Attention（看局部）**，但在特定的层（如第 7, 15, 23, 31 层）放开限制做 **Global Attention（看全局）**。这在极大节省算力的同时，依然保证了长程语义的联通。详见 [[window_attention_交错注意力]]。
-
-**Window Attention 示意图**：
-![Window Attention](../assets/qwen25_vl/v2-285daabd1a4a0e9563997736a416abad_r.jpg)
-
-需要注意的是，由于进入 ViT 前我们把 $2 \times 2$ 的 Patch 排列成了连续的 Token（见上文 Conv3D），同一个窗口内的 Token 并不是天生连续的。为了做 Window Attention，必须在内部做形状 Reshape（调换顺序）：
-![Patch Arrangement](../assets/qwen25_vl/v2-a635f83d96f40ad6df357485cf26f9ba_r.jpg)
-
-### 2. 归一化 (RMSNorm)
-**组件职责**：稳定数据分布，对抗数值爆炸或梯度消失。
-**为什么不用 LayerNorm 换成了 RMSNorm？**
-- 深度网络层数多（32层），如果不归一化，乘法累积会导致特征张量的值要么爆炸变成 NaN，要么消失归零。
-- 传统 ViT 用 LayerNorm（不仅除以方差，还减去均值）。但在大语言模型中发现，**均值偏移对表达能力影响不大，真正破坏稳定性的是方差过大**。因此 Qwen 统一使用了 RMSNorm（Root Mean Square Norm），只做方差缩放，去掉了均值计算，不仅保证了稳定，还加快了训练速度。详见 [[rmsnorm_归一化]]。
-
-### 3. 带偏置的门控前馈网络 (SwiGLU / FFN)
-**组件职责**：提供**非线性表达能力**和**特征的重新组合**。
-**物理原理与演进**：
-- **为什么需要 FFN？** Attention 只能将各个 Patch 的特征做线性加权组合（把别人的特征掺和到自己身上）。但要识别复杂的物体（如“非线性分类问题”），必须要有全连接层（升维再降维）配合激活函数进行特征过滤。
-- **什么是 SwiGLU？** 它是 GLU（门控线性单元）和 Swish 激活函数的结合。相当于它不仅做了非线性映射，还多了一条“门控”通道，模型可以通过门控通道自己决定“哪些特征该放行，哪些噪音该被拦截”。
-- **为什么要带偏置（Bias=True）？** 文本是大脑构造的离散符号，没有物理底噪；但图像是传感器捕捉的连续模拟信号，天生带有环境光照带来的**直流底噪（DC Offset）**。给 FFN 的神经元加上偏置（Bias），就像给温度计加上了校准归零按钮，网络可以轻松学到一个常数来抵消底噪，防止宝贵的注意力算力被浪费在拟合常数上。详见 [[swiglu_门控激活函数]]。
+| 组件 | Qwen2.5-VL (当前) | Qwen3-VL (演化) | 物理意义 |
+|------|-----------------|---------------|---------|
+| **Norm** | RMSNorm | **LayerNorm 回退** | Qwen3-VL 发现 LayerNorm 在超大规模多模态混合训练下更稳定 |
+| **Bias** | `bias=True` | `bias=True` | 坚持开启偏置以对抗传感器噪声 |
+| **RoPE** | 2D-RoPE | **MRoPE-Interleave** | Qwen3-VL 实现了时空位置编码的深度交织 |
 
 ---
+
 ## 关联概念
-- ✅ 支持 [[qwen2.5_vl_技术报告解析]]：构成了视觉主干网的核心解释。
-- [[conv3d_时空切块器]]：ViT 的前置嵌入层，提供物理滤波特征。
-- [[patchmerger_空间降维]]：ViT 的后置桥接器，将高级语义特征降维送给大语言模型。
+
+- ✅ 支持 [[qwen2.5_vl_三阶段预训练]]：在 Stage 0/1/2 中作为主要训练目标。
+- 上游：接收 [[conv3d_时空切块器]] 的输出。
+- 内部：由 [[window_attention_交错注意力]]、[[swiglu_门控激活函数]]、[[rmsnorm_归一化]] 组成。
+- 下游：输出送往 [[patchmerger_空间降维]]。
+
+## 参考来源
+
+- `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+- `knowledge_base/raw/面试官!从Qwen-VL到Qwen3.5技术改进？(26年2月版)/面试官!从Qwen-VL到Qwen3.5技术改进？(26年2月版) .md`

@@ -78,8 +78,7 @@
               "title": "conv3d_时空切块器"
             }
           }
-        ],
-        "currentTab": 2
+        ]
       },
       {
         "id": "12d31c36ae59c255",
@@ -92,13 +91,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "concepts/vit_核心原理与结构.md",
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "vit_核心原理与结构 的大纲"
+              "title": "qwen2.5_vl_深度剖析学习指南 的大纲"
             }
           }
         ]
@@ -249,10 +248,11 @@
       "bases:新建数据库": false
     }
   },
-  "active": "64a706fc79b6a5a8",
+  "active": "342dbe85798c88d9",
   "lastOpenFiles": [
-    "concepts/convolution_卷积家族原理.md",
+    "synthesis/qwen3.5_深度剖析学习指南.md",
     "concepts/vit_核心原理与结构.md",
+    "concepts/convolution_卷积家族原理.md",
     "synthesis/qwen2.5_vl_深度剖析学习指南.md",
     "concepts/clip_对比学习视觉编码.md",
     "concepts/rope_旋转位置编码.md",
@@ -289,7 +289,6 @@
     "index.md",
     "assets/qwen25_vl",
     "assets",
-    "synthesis/_fix_guide.py",
-    "sources/qwen2.5_vl_技术报告解析.md"
+    "synthesis/_fix_guide.py"
   ]
 }

@@ -221,6 +221,34 @@ video_grid_thw = torch.tensor([
 
 ---
 
+## 7. 动态分辨率方案深度对比：原生 vs 切片 (Tiling)
+
+在业界，除了 Qwen 采用的 NaViT 原生方案外，还有另一大流派：**基于切片的动态分辨率 (Dynamic Tiling)**。
+
+| 维度 | Qwen系列 (Native Dynamic Resolution) | InternVL / LLaVA-NeXT (Dynamic Tiling) |
+| :--- | :--- | :--- |
+| **核心思想** | **整体缩放**：根据长宽比等比缩放至限制范围内，直接将整图视为一个超大的 Patch 网格。 | **拼图切片**：根据长宽比，将图像切分为若干个固定的方块（如 448x448），再加一张全局缩略图。 |
+| **位置编码** | 必须抛弃绝对位置，改用 **2D-RoPE**。 | 可以复用现成的绝对位置编码（因为每个 Tile 尺寸固定）。 |
+| **Batch 处理** | 不同图片产生的 Token 序列变长，需要复杂的 Padding 或 **Patch n' Pack** 以及对角 Attention Mask 隔离。 | 每个 Tile 尺寸一致，切块过程如同生成一个标准的 Batch，处理更为规整。 |
+| **局部细节** | 取决于 `max_pixels` 的上限设置。 | 切片可以切出极高分辨率的局部块，局部清晰度极高。 |
+| **全局关系** | ViT 的 Attention 是在全图计算的，不会割裂。 | Tile 之间被物理割裂了，需要依赖额外的缩略图 (Thumbnail) 提供宏观语义。 |
+| **Token 消耗** | 相对较少（仅为长宽网格数）。 | 消耗极大（尤其是带重叠的切片 + 缩略图，动辄数千上万 Token）。 |
+
+*注：两种方案各有优劣，Qwen 的原生方案在架构上更简洁统一，而 Tiling 方案在复用开源 ViT 权重和工程落地（不挑显卡框架）上更讨巧。*
+
+---
+
+## 8. 视觉 Token 压缩技术 (Vision Token Compression)
+
+原生支持动态高分辨率后，不可避免地带来了“**Token 数量爆炸**”的副作用（一张 4K 图可能产生上万个 Token），这会迅速耗尽 LLM 的上下文窗口。为此，催生了视觉 Token 压缩技术，目前有四大流派：
+
+1.  **基于变换 (Transformation-based)**：如 Qwen2.5-VL 使用的 [[patchmerger_空间降维]] (2x2 合并) 或 InternVL 的 Pixel Unshuffle。简单高效，能保留结构，但压缩率是写死的。
+2.  **基于相似性 (Similarity-based)**：利用余弦相似度，将背景中长得一样的天空或白墙 Token 融合（如 ToMe）。
+3.  **基于注意力 (Attention-based)**：利用 ViT 内部的 Attention 权重，直接剪枝掉模型不关注的背景 Token（如 FastV）。
+4.  **基于查询 (Query-based)**：用少量的可学习 Query 向量，通过 Cross-Attention 去主动提取图像特征（如 BLIP-2 的 Q-Former 或早期的 Qwen1-VL）。压缩率极高，但有丢失细粒度信息（如密集文字 OCR）的风险。
+
+---
+
 ## 关联概念
 
 - ✅ 支持 [[qwen2.5_vl_技术报告解析]]：Qwen2.5-VL 的视觉编码器核心理念来源于 NaViT。

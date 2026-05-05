@@ -11,85 +11,139 @@ status: active
 
 ## 模块整体说明与架构拆解
 
-视觉骨干网（Vision Backbone）是 Qwen2.5-VL 的**“语义核心熔炉”**。它的职责是接收由 [[conv3d_时空切块器]] 输出的、仅具备局部特征的视觉序列，通过 **32 层** 高度统一的 Transformer Block 深度堆叠，利用注意力机制（Attention）实现全局信息交换。
+视觉骨干网（Vision Backbone）是多模态大模型的“语义核心熔炉”。以 Google 于 2020 年提出的原始 Vision Transformer (ViT) 为开端，它首次证明了：**不需要卷积神经网络 (CNN) 的强空间归纳偏置，纯 Transformer 也能在图像领域提取出极具表达力的全局语义特征。** 
 
-在这一阶段，离散的“像素切块特征”被提纯为具备高级语义概念（如：物体、场景、文字、动作）的视觉向量序列，为最终进入大语言模型（LLM）做好准备。
+在 Qwen-VL 系列中，ViT 被深度改造并“LLM 化”，其职责是接收预处理后的视觉序列，通过 **32 层** 高度统一的 Transformer Block 深度堆叠，完成从“像素光影”到“高级语义（物体、动作、场景）”的跨越，为最终进入大语言模型（LLM）做好准备。
 
-### 内部架构流转
-Qwen2.5-VL 的 ViT 架构呈现出极致的“LLM 镜像化”特征。其 32 层 Block 并不是一成不变的重复，而是通过**注意力视野的交替切换**来实现算力与性能的平衡：
+### 渊源与演化：原始 ViT (2020) 的奠基流转
+![](<images/ViT(2020, Google Research)-image.png>)
+![](<images/ViT(2020, Google Research)-vit流程图.png>)
 
-```mermaid
-graph TD
-    A["输入: 1152 维序列 (3B) / 3584 维 (7B)"] --> B["Block 1-6: Window Attention (局部细节提纯)"]
-    B --> C["Block 7: Global Attention (全局视野拉通)"]
-    C --> D["Block 8-14: Window Attention"]
-    D --> E["Block 15: Global Attention"]
-    E --> F["... 循环至 Block 31: Global Attention"]
-    F --> G["Block 32: Final Global Attention"]
-    G --> H["输出: 深层视觉特征序列"]
+原始 ViT 的架构完全复用了 NLP 领域的标准 Transformer Encoder：
+1. **Linear Projection (Patch Embedding)**：将二维图片切分成无重叠的 Patch，展平并通过全连接层映射为 1D Token 序列。
+2. **[CLS] Token 与 Positional Embedding**：在序列头部追加一个用于分类的 Token，并为所有 Token 加上 1D 可学习绝对位置编码。
+3. **Transformer Encoder**：由交替的 `LayerNorm -> Multi-Head Attention (MSA)` 和 `LayerNorm -> MLP (Inverted Bottleneck)` 组成，循环 $L$ 层。
+4. **MLP Head**：仅提取 `[CLS]` Token 的特征，用于图像分类。
 
-    subgraph "单个 Block (VisionBlock) 内部核心算子"
-        N1["① RMSNorm (Pre-Norm)"] --> ATT["② Attention: 跨 Patch 空间融合"]
-        ATT --> ADD1["③ 残差连接 (Residual)"]
-        ADD1 --> N2["④ RMSNorm"]
-        N2 --> MLP["⑤ SwiGLU MLP: 单 Patch 内部通道提纯 (bias=True)"]
-        MLP --> ADD2["⑥ 残差连接"]
-    end
+### 架构演化对比：Qwen2.5-VL 的“LLM 化”颠覆
+为了让视觉特征与语言大模型能够更顺畅地对接（降低跨模态对齐的“方言差”），Qwen 团队对 ViT 进行了彻底的改造：
+
+| 组件 | 原始 ViT (2020) | Qwen2.5-VL ViT | 演化本质与原理解读 |
+| :--- | :--- | :--- | :--- |
+| **位置编码** | 1D 可学习绝对位置，**直接加 (Add)** 在输入上。数学本质是 $W(I+P)=WI+WP$，相加等价于一种特殊的高效 Concatenate | **2D-RoPE**，在 Attention 内部进行复数旋转 | 绝对位置编码锁死了分辨率，2D-RoPE 天然支持任意分辨率和长宽比外推。 |
+| **全局聚合** | 依赖序列开头的 `[CLS]` Token | **抛弃 `[CLS]` Token**，全部 Token 降维后送入 LLM | MLLM 不需要做简单的图像分类，而是需要密集的局部和全局语义输入给 LLM。 |
+| **归一化策略** | LayerNorm | **RMSNorm** | 抛弃均值平移，与 Qwen2.5 文本端完全对齐，提升计算速度。 |
+| **非线性激活** | GELU | **SwiGLU (且 bias=True)** | 文本端使用无偏置 SwiGLU，视觉端为了对抗传感器直流偏移底噪开启偏置。 |
+| **注意力范围** | 每层都是全图 Global Attention | **Window Attention** 为主，1/8 的层穿插 Global | 在原生极高分辨率下，$O(N^2)$ 全图计算会 OOM，交错窗口既省算力又保住了宏观意图。 |
+
+---
+
+## 核心底层神经元级别的微观放大镜 (Tensor Flow)
+
+为了破除“黑盒”迷信，我们以原始 ViT-Base 处理一张 $224 \times 224 \times 3$ 的图像为例，用显微镜观察数据在每一层神经元中的张量形变（Tensor Shape）。
+
+### 1. 物理切块与 Patch Embedding
+*   **输入**：Image $X \in \mathbb{R}^{B \times 3 \times 224 \times 224}$
+*   **动作**：使用 `kernel_size=16`, `stride=16` 的 2D 卷积核，将图像切分为 $14 \times 14 = 196$ 个 Patch。每个 Patch 区域（$16 \times 16 \times 3 = 768$ 个像素值）被映射为一个 768 维的向量。
+*   **张量形变**：`[B, 3, 224, 224] -> Conv2d -> [B, 768, 14, 14] -> flatten -> [B, 768, 196] -> transpose -> [B, 196, 768]`
+
+### 2. [CLS] 拼接与位置编码融合
+*   **[CLS] Token**：这是一个 `nn.Parameter(torch.randn(1, 1, 768))`，拓展到 Batch 后与 Patch 序列 `cat`，长度变为 197。`[B, 197, 768]`
+*   **位置编码**：生成一个形状为 `[1, 197, 768]` 的可学习参数。直接与输入相加 `x = x + pos_embed`。
+*   **第一性原理**：为什么要相加而不是 Concat？因为 $W(I+P) = WI+WP$，相加等效于在特征拼接后再做一次联合线性变换，既保留了空间信息，又极其节约显存。
+
+### 3. 多头注意力机制 (Multi-Head Attention, MSA) 的微观解剖
+这是 Transformer 的跨空间融合核心。
+*   **输入**：`X`，形状 `[B, 197, 768]`。
+*   **QKV 线性映射**：通过一个 `nn.Linear(768, 768*3)`，将输入扩展为 `[B, 197, 2304]`。
+*   **多头拆分**：将 2304 劈开为 Q, K, V。假设 Head=12，则每个 Head 的维度 `head_dim = 768/12 = 64`。
+    `[B, 197, 3, 12, 64] -> permute -> Q, K, V 分别为 [B, 12, 197, 64]`
+*   **注意力分数矩阵 (Attention Matrix)**：
+    计算 $Q \cdot K^T$：`[B, 12, 197, 64] @ [B, 12, 64, 197] -> [B, 12, 197, 197]`
+    这个 $197 \times 197$ 的矩阵就是全局注意力热力图。除以 $\sqrt{64}$ (Scale) 防止 Softmax 梯度消失，然后算 Softmax，得出权重。
+*   **特征加权 (Weighted Sum)**：
+    `[B, 12, 197, 197] @ [B, 12, 197, 64] -> [B, 12, 197, 64]`。随后把 12 个头拼回去，变回 `[B, 197, 768]`。
+*   **物理意义**：经过这一步，原本只代表“猫耳朵”的 Patch 向量内部，按照 Softmax 的权重，被狠狠地“混入”了“猫眼睛”和“猫尾巴”的数值。孤立的像素碎片演化成了连贯的“猫”。
+
+### 4. MLP 层：倒瓶颈结构 (Inverted Bottleneck) 的通道提纯
+如果说 Attention 是让所有 Token “串门互通”，那么 MLP 就是让每个 Token “关起门来内部消化”。
+*   **网络结构**：两层全连接层 `Linear(768, 3072) -> GELU -> Linear(3072, 768)`。
+*   **第一性原理 (倒瓶颈)**：不同于 ResNet 先降维再升维的 Bottleneck（为了省算力）。ViT 采用**先将通道数放大 4 倍，再缩减回来**的 Inverted Bottleneck 结构。这是因为在高维空间中，特征之间更容易被非线性激活函数（如 GELU/SwiGLU）解耦和过滤，从而极大地增强模型对复杂视觉概念的表达能力。
+
+### 5. 残差连接 (Residual) 与高速公路
+每一层 Attention 和 MLP 的外面都包着一个残差 `x = x + module(norm(x))`。
+*   **物理意义**：不仅防止了前向传播时原始物理像素特征在深层网络中丢失，更在**反向传播**中充当了“梯度高速分配器”，将 Loss 无损地传导回第一层的切块器，根绝梯度消失。
+
+---
+
+## 核心源码解剖 (从原始 ViT 到 Qwen)
+
+要真正破除黑盒，没有什么比直接看 PyTorch 源码更直观的了。以下是基础组件的标准代码实现。
+
+### 1. 原始 ViT 的 Patch Embedding
+将卷积切图和张量重塑（展平、转置）一气呵成：
+```python
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
+        super().__init__()
+        # 利用 2D 卷积的无重叠滑动，直接切出 Patch 并映射到 768 维
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x)      # [B, 3, 224, 224] -> [B, 768, 14, 14]
+        x = x.flatten(2)      # [B, 768, 14, 14] -> [B, 768, 196]
+        x = x.transpose(1, 2) # [B, 768, 196]    -> [B, 196, 768] (这就是标准的 Transformer 序列格式)
+        return x
 ```
 
-### 全局代码调用顺序与流转概览
-1.  **准备阶段**：`Qwen2_5_VisionTransformerPretrainedModel.forward` 接收 `pixel_values` 与 `grid_thw`。
-2.  **入口**：调用 `patch_embed` 完成 Conv3D 投影与拉平。
-3.  **循环迭代**：在一个 32 次的循环中，逐个调用 `self.blocks`。
-    - 在循环内部，系统根据 `config.fullatt_block_indexes`（默认 `[7, 15, 23, 31]`）动态决定当前层是执行 **[[window_attention_交错注意力#全局视野 (Global Attention)]]** 还是 **[[window_attention_交错注意力#窗口视野 (Window Attention)]]**。
-4.  **收官**：经过最后一次 RMSNorm 归一化后，输出结果给下游 [[patchmerger_空间降维]]。
+### 2. 原始 ViT 的多头注意力 (MultiheadAttention)
+重点观察 `qkv` 的剥离和最后合并多头的形变：
+```python
+class MultiheadAttention(nn.Module):
+    def __init__(self, embed_dim=768, num_heads=12):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (embed_dim // num_heads) ** -0.5
+        # 一次性生成 Q, K, V
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.out_linear = nn.Linear(embed_dim, embed_dim)
 
----
+    def forward(self, x):
+        B, N, C = x.shape  # 例如 B, 197, 768
+        
+        # 1. 映射并拆分为 3 份 (Q,K,V) 和多头 (heads)
+        # [B, 197, 3, 12, 64] -> permute -> [3, B, 12, 197, 64]
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # 每个都是 [B, 12, 197, 64]
+        
+        # 2. Q * K^T 计算热力图
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, 12, 197, 197]
+        attn = attn.softmax(dim=-1)
+        
+        # 3. 乘以 Value 并合并多头
+        # [B, 12, 197, 64] -> transpose -> [B, 197, 12, 64] -> reshape -> [B, 197, 768]
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        # 4. 最终投影
+        return self.out_linear(x)
+```
 
-## 逻辑链输入与输出
-
-- **逻辑链（输入）**：由 `patch_embed` 输出的视觉特征序列 `[TotalPatch, 1152]` (以 3B 为例)。
-- **逻辑链（输出）**：深层高级视觉语义序列 `[TotalPatch, 1152]`。
-  - **关键认知**：维度（Shape）在整个 Backbone 过程中保持不变，但向量内部的数值已经完成了从“像素感知”到“意图理解”的演化。
-
----
-
-## 单层 Block 内部计算的微观放大镜 (Tensor Flow)
-
-许多初学者对 Transformer 内部的流转感到困惑：一个 `[TotalPatch, 1152]` 的张量是如何经过一层计算，使得每个 Patch 的特征向量中都“包含”了整张图的注意力的？
-
-我们将一层 `Qwen2_5_VLVisionBlock` 的前向计算按顺序放大拆解：
-
-### 1. Pre-Norm (RMSNorm)
-- **输入**：`X`，形状 `[TotalPatch, 1152]`。
-- **操作**：对 1152 个通道维度计算方差并进行缩放。
-- **物理意义**：把信号的尺度拉平，防止输入给后续算子的数值过大导致梯度爆炸。这是维稳的基石。👉详见 [[rmsnorm_归一化]]。
-
-### 2. 跨空间融合：多头注意力机制 (Attention)
-这是 ViT 产生“全局视野”的核心环节。
-- **操作**：
-  1. `X` 分别乘以三个权重矩阵 $W_q, W_k, W_v$，得到 $Q$（查询）、$K$（键）、$V$（值）。
-  2. 根据 [[2d_rope_视觉位置编码]]，对 $Q$ 和 $K$ 进行旋转，注入位置坐标。
-  3. **注意力矩阵计算**：$Attention = \text{Softmax}\left(\frac{Q K^T}{\sqrt{d}}\right)$。
-     - *微观解释*：假设我们关注 Patch A（比如猫的耳朵）。Patch A 的 $Q_A$ 向量会和图里所有其他 Patch 的 $K$ 向量进行点积（计算相似度）。如果 Patch B（比如猫的眼睛）和它的点积值很大，Softmax 之后 Patch A 给 Patch B 分配的权重就非常高（比如 0.8）。
-  4. **加权求和**：$Output_A = 0.8 \times V_B + 0.1 \times V_C + ...$
-- **物理意义**：**Attention 是在做跨 Patch（空间）的信息混合**。经过这一步，Patch A 原本只包含“尖尖的形状”的 1152 维向量，现在被混入了“眼睛”和“胡须”的特征，从而演化出了“猫”的初级概念。
-- **关于视频帧的注意边界**：注意，**ViT 内部的 Attention 是严格的单帧空间（Spatial）计算**。哪怕输入的是视频，[[packing_物理隔离机制]] 也会把视频的不同帧隔离成独立的图片。时间维度的融合一部分已经在上游的 Conv3D 完成（2合1），剩余的时间因果理解则交给下游的 LLM 处理。
-
-### 3. 残差连接 1 (Residual Add)
-- **操作**：`X_new = X_original + Attention_Output`。
-- **物理意义**：原始特征信号走“捷径”直接加到了融合后的特征上。防止网络太深导致最初的物理特征丢失。
-
-### 4. 单点通道过滤：非线性多层感知机 (SwiGLU)
-- **操作**：`X_new` 再次经过 RMSNorm，然后进入 SwiGLU MLP。
-  - `Up` 投影：将维度从 1152 升维到 4928。
-  - `Gate` 投影：同样的升维，但加上 Swish 激活函数。
-  - 逐元素相乘后，再通过 `Down` 投影降维回 1152。
-- **物理意义**：如果说 Attention 是不同 Patch 在互相串门，那么 **MLP 就是每个 Patch 关起门来做内部消化**。它不跨空间混合信息，只负责在这个 Patch 的 1152 维特征内部进行非线性的组合、筛选和特征放大。为了对抗传感器的物理底噪，这里的 MLP 开启了 `bias=True`。👉详见 [[swiglu_门控激活函数]]。
-
-### 5. 残差连接 2 (Residual Add)
-- **操作**：`X_final = X_new + MLP_Output`。
-- **输出**：这一层的最终结果，准备喂给下一层。
+### 3. Qwen2.5-VL 的视觉块 (Vision Block)
+Qwen 的架构中引入了动态窗口切换和 RMSNorm：
+**文件路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+```python
+class Qwen2_5_VLVisionBlock(nn.Module):
+    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        # 1. 第一层归一化 + 注意力 (Residual Path 1)
+        # 注意：cu_seqlens 决定了视野是 Window 还是 Global；rotary_pos_emb 注入 2D-RoPE
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states), cu_seqlens, rotary_pos_emb
+        )
+        # 2. 第二层归一化 + MLP (Residual Path 2)
+        # 注意：视觉侧 MLP 开启了 bias=True 对抗底噪
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+```
 
 ---
 
@@ -114,128 +168,23 @@ graph TD
 
 ---
 
-## 前向推理与反向传播 (Training vs Inference Flow)
-
-模型不仅要能正向计算，更要在训练中更新参数。
-
-### 前向推理 (Forward Pass)
-1. **Conv3D 压平**的特征流进入 ViT。
-2. 像流水线车间一样，数据依次穿过 32 层 Block。
-3. 每穿过一层，特征向量里的“语义浓度”就提高一分。
-4. 最终输出的 `[TotalPatch, 1152]` 送入 [[patchmerger_空间降维]]。
-
-### 反向传播 (Backward Pass & Gradients Flow)
-在训练阶段，当 LLM 输出最终文本并计算出 Loss（例如交叉熵损失）后：
-1. **梯度回传**：Loss 首先对 LLM 的参数求导，然后顺着网络一路反向传回 PatchMerger，最后进入 ViT 的第 32 层。
-2. **残差的“高速公路”作用**：ViT 有 32 层，如果梯度只能一层层乘过去，早就因为数值太小而消失了（梯度消失问题）。
-   - 在反向传播时，残差连接（`+` 操作）是一个**梯度分配器**（Gradient Distributor）。
-   - 它会将梯度 $100\%$ 无损地通过捷径传给上一层，同时也将梯度传给当前的 Attention 和 MLP 让它们更新权重。
-   - 这就保证了即便在第 1 层的 Conv3D，依然能收到强烈的梯度信号来指导视觉特征的提取。
-
----
-
-## 核心算法原理详解
-
-### 1. 为什么需要 32 层堆叠？ (第一性原理)
-
-**第一性原理推导**：卷积层（Conv3D）的感受野仅为 $14 \times 14 \times 2$，它就像是一面布满了几万个小孔的墙，模型只能通过每个小孔看到极窄的一角。
-- **语义分层演化**：
-  - **Layer 1-8 (局部认知)**：模型还在整理边缘、颜色块和简单的纹理。
-  - **Layer 9-24 (部件组装)**：注意力开始让相邻的 Patch 对话，拼凑出“眼睛”、“轮子”或“笔画”。
-  - **Layer 25-32 (全局语义)**：通过每 8 层一次的全局注意力，模型终于看清了“这是一个正蹲在草地上盯着蝴蝶的猫”。
-- **结论**：**堆叠的深度决定了模型抽象能力的上限**。如果只有 1 层，模型永远只能看到像素点，无法建立宏观联系。
-
-### 2. 渊源与演化：原始 ViT (2020) vs Qwen 视觉侧的“LLM 化”
-
-要深刻理解 Qwen2.5-VL 的视觉架构，我们必须追溯到它的老祖宗：Google 于 2020 年提出的原始 Vision Transformer (ViT)。原始 ViT 首次证明了：**不需要卷积神经网络 (CNN) 的强空间归纳偏置，只要数据量足够大，纯 Transformer 也能在图像领域创造奇迹。**
-
-**原始 ViT 的数据流 (2020)**：
-![](<images/ViT(2020, Google Research)-image.png>)
-
-1.  **Patch Embedding**：将 $H \times W \times C$ 的三维图像暴力展平为 $N \times (P^2 \cdot C)$ 的 2D 序列，每个 Patch 作为一个独立的 Token。
-2.  **CLS Token**：在序列开头强行插入一个可学习的 `[CLS]` Token，用于在最后输出时聚合全图特征做分类。
-3.  **1D Positional Embedding**：直接把一个与序列等长的 1D 可学习张量“加（Add）”到 Patch Token 上，这是绝对位置编码。
-4.  **Transformer Encoder**：标准的 `LayerNorm -> Multi-Head Attention -> LayerNorm -> MLP (GELU)` 堆叠。
-
-**强类比对比：Qwen2.5-VL 的颠覆性“LLM 化”**
-Qwen 团队并没有照搬原始 ViT，而是做出了核心哲学转变——**让视觉编码器长得越来越像 LLM**，以此降低跨模态对齐的“方言差”。
-
-| 组件 | 原始 ViT (2020) | Qwen2.5-VL ViT | 演化本质与原理解读 |
-| :--- | :--- | :--- | :--- |
-| **位置编码** | 1D 可学习绝对位置，**直接加 (Add)** 在输入上。数学本质是 $W(I+P)=WI+WP$，相加等价于一种特殊的高效 Concatenate | **2D-RoPE**，在 Attention 内部进行复数旋转 | 绝对位置编码锁死了分辨率，2D-RoPE 天然支持任意分辨率和长宽比外推。 |
-| **全局聚合** | 依赖序列开头的 `[CLS]` Token | **抛弃 `[CLS]` Token**，全部 Token 降维后送入 LLM | MLLM 不需要做简单的图像分类，而是需要密集的局部和全局语义输入给 LLM。 |
-| **归一化策略** | LayerNorm | **RMSNorm** | 抛弃均值平移，与 Qwen2.5 文本端完全对齐，提升计算速度。 |
-| **非线性激活** | GELU | **SwiGLU (且 bias=True)** | 文本端使用无偏置 SwiGLU，视觉端为了对抗传感器直流偏移底噪开启偏置。 |
-| **注意力范围** | 每层都是全图 Global Attention | **Window Attention** 为主，1/8 的层穿插 Global | 在原生极高分辨率下，$O(N^2)$ 全图计算会 OOM，交错窗口既省算力又保住了宏观意图。 |
-
-**这种“架构统一”的终极物理意义**：
-视觉特征与文本特征在数学分布和底层算子（RMSNorm, SwiGLU, RoPE）上越接近，后续在 Stage 1/2 进行跨模态对齐（Alignment）的难度就越低。就像让两个说不同方言的人改说普通话，沟通效率会极大提升。
-
----
-
-## 核心源码解剖
-
-**文件路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
-
-```python
-# 视觉骨干网主体
-class Qwen2_5_VLVisionTransformer(Qwen2_5_VisionTransformerPretrainedModel):
-    def __init__(self, config: Qwen2_5_VLVisionConfig):
-        super().__init__(config)
-        # 初始化 32 层 Block
-        self.blocks = nn.ModuleList(
-            [Qwen2_5_VLVisionBlock(config) for _ in range(config.num_hidden_layers)]
-        )
-        ...
-
-# 单个 Block 实现
-class Qwen2_5_VLVisionBlock(nn.Module):
-    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb):
-        # 1. 第一层归一化 + 注意力 (Residual Path 1)
-        # 注意：cu_seqlens 决定了视野是 Window 还是 Global
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cu_seqlens, rotary_pos_emb
-        )
-        # 2. 第二层归一化 + MLP (Residual Path 2)
-        # 注意：视觉侧 MLP 开启了 bias=True
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-```
-
----
-
-## 参数心算验证 (以 3B 模型为例)
-
-| 组件 | 计算公式 | 参数量 (约) | 角色 |
-| :--- | :--- | :--- | :--- |
-| **RMSNorm** | $1152 \times 2$ (Block 内) | 2.3k | 稳定性锚点 |
-| **Attention** | $1152 \times 1152 \times 4$ ($Q/K/V/O$) | 5.3M | 跨空间语义融合器 |
-| **SwiGLU MLP** | $1152 \times 4928 \times 3$ (Gate/Up/Down) | 17M | 单点特征过滤器 |
-| **单层总计** | | **22.3M** | |
-| **32层总计** | $22.3M \times 32$ | **713M** | 视觉大脑主体 |
-
-> **注**：加上 `patch_embed` 和 `merger` 后，3B 模型的视觉侧总参数量约为 **0.7B** 左右。
-
----
-
 ## 质量自我审查与准出标准
 
-1.  **流转逻辑看懂了吗？**：必须能闭眼描述出 `[TotalPatch, 1152]` 是如何依次通过 Norm -> Attention -> Add -> Norm -> MLP -> Add 的。
-2.  **融合机制清楚了吗？**：能解释 Attention 是如何通过 $QK^T$ 让一个 Patch 获取全局（或窗口）特征的，而 MLP 只是在 Patch 内部混合通道。
-3.  **看破 Bias 细节了吗？**：明白视觉侧 MLP 的 `bias=True` 是为了对抗物理传感器底噪，而文本端不需要（见 [[swiglu_门控激活函数]]）。
-4.  **理解反向传播的高速公路了吗？**：知道在 32 层深的网络中，残差连接是如何保证梯度不消失的。
+1.  **流转张量看懂了吗？**：必须能闭眼描述出 `[B, 197, 768]` 是如何依次在 MSA 内部劈开成多头计算 Attention，再在 MLP 中膨胀 4 倍又收缩回来的。
+2.  **融合机制清楚了吗？**：能解释 Attention 是如何通过 $QK^T$ 让一个 Patch 获取全局特征的，而 MLP 只是在单个 Patch 内部混合通道。
+3.  **理解反向传播的高速公路了吗？**：知道在 32 层深的网络中，残差连接是如何保证梯度不消失的。
 
 ---
 
 ## 关联概念
 
-- [[conv3d_时空切块器]]：上游输入，提供原始 5D 时空嵌入。
-- [[window_attention_交错注意力]]：核心注意力机制，实现算力节省。
+- [[conv3d_时空切块器]]：Qwen 体系下的上游输入，提供原始 5D 时空嵌入。
+- [[window_attention_交错注意力]]：核心注意力机制升级，实现算力节省。
 - [[swiglu_门控激活函数]]：核心非线性单元，负责特征过滤。
 - [[rmsnorm_归一化]]：数值稳定性的基石。
 - [[patchmerger_空间降维]]：下游衔接，将提纯后的 32 层特征进行最后的 4 倍压缩。
 
 ## 参考来源
-- `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+- 论文：*An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (2020)*
+- 原始资料：`knowledge_base/raw/ViT(2020, Google Research)/ViT(2020, Google Research).md`
 - `knowledge_base/raw/万字长文图解Qwen2.5-VL实现细节_猛猿_2025-06-25/index.md`
-- 论文：*Qwen2-VL: To See the World from a New Perspective* (2024)

@@ -9,6 +9,20 @@
         "dimension": 78.19148936170212,
         "children": [
           {
+            "id": "342dbe85798c88d9",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "qwen2.5_vl_深度剖析学习指南"
+            }
+          },
+          {
             "id": "64a706fc79b6a5a8",
             "type": "leaf",
             "state": {
@@ -37,17 +51,17 @@
             }
           },
           {
-            "id": "342dbe85798c88d9",
+            "id": "b61d4a481447f3b0",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+                "file": "concepts/conv3d_时空切块器.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "qwen2.5_vl_深度剖析学习指南"
+              "title": "conv3d_时空切块器"
             }
           }
         ],
@@ -64,13 +78,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "concepts/clip_对比学习视觉编码.md",
+                "file": "concepts/vit_核心原理与结构.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "clip_对比学习视觉编码 的大纲"
+              "title": "vit_核心原理与结构 的大纲"
             }
           }
         ]
@@ -146,7 +160,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "concepts/clip_对比学习视觉编码.md",
+                "file": "concepts/vit_核心原理与结构.md",
                 "collapseAll": true,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -156,7 +170,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "clip_对比学习视觉编码 的反向链接列表"
+              "title": "vit_核心原理与结构 的反向链接列表"
             }
           },
           {
@@ -165,12 +179,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "concepts/clip_对比学习视觉编码.md",
+                "file": "concepts/vit_核心原理与结构.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "clip_对比学习视觉编码 的出链列表"
+              "title": "vit_核心原理与结构 的出链列表"
             }
           },
           {
@@ -221,19 +235,20 @@
       "bases:新建数据库": false
     }
   },
-  "active": "ea969b0032b6e445",
+  "active": "64a706fc79b6a5a8",
   "lastOpenFiles": [
+    "concepts/rope_旋转位置编码.md",
+    "synthesis/qwen2.5_vl_深度剖析学习指南.md",
+    "concepts/vit_核心原理与结构.md",
+    "concepts/clip_对比学习视觉编码.md",
     "concepts/conv3d_时空切块器.md",
     "concepts/convolution_卷积家族原理.md",
-    "synthesis/qwen2.5_vl_深度剖析学习指南.md",
     "concepts/qwen2.5_vl_三阶段预训练.md",
-    "concepts/vit_核心原理与结构.md",
     "concepts/2d_rope_视觉位置编码.md",
     "concepts/patchmerger_空间降维.md",
     "concepts/mrope_多模态位置编码.md",
     "sources/qwen_evolution_架构演进与前沿底座.md",
     "sources/dynamic_resolution_动态分辨率.md",
-    "concepts/clip_对比学习视觉编码.md",
     "sources/vision_foundation_视觉基石与卷积.md",
     "concepts/images/面试官：VLM 的动态分辨率是怎么做的？ -截屏2025-12-18 01.36.25.png",
     "concepts/images/面试官：VLM 的动态分辨率是怎么做的？ -截屏2025-04-16 08.18.20.png",
@@ -247,7 +262,6 @@
     "concepts/images/面试官!从Qwen-VL到Qwen3.5技术改进？(26年2月版) -截屏2025-09-27 19.09.06-1.png",
     "concepts/llm_backbone_大语言模型基座.md",
     "concepts/images",
-    "concepts/rope_旋转位置编码.md",
     "sources/rope_系列原理解析.md",
     "concepts/window_attention_交错注意力.md",
     "concepts/rmsnorm_归一化.md",

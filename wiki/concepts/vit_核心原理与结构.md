@@ -11,139 +11,155 @@ status: active
 
 ## 模块整体说明与架构拆解
 
-视觉骨干网（Vision Backbone）是多模态大模型的“语义核心熔炉”。以 Google 于 2020 年提出的原始 Vision Transformer (ViT) 为开端，它首次证明了：**不需要卷积神经网络 (CNN) 的强空间归纳偏置，纯 Transformer 也能在图像领域提取出极具表达力的全局语义特征。** 
+视觉骨干网（Vision Backbone）是多模态大模型的“语义核心熔炉”。以 Google 于 2020 年提出的原始 Vision Transformer (ViT) 为开端，它打破了卷积神经网络 (CNN) 的空间归纳偏置，直接将图像按物理块（Patch）展平，利用 Transformer 的全局注意力机制提纯出极具表达力的高级语义特征。
 
-在 Qwen-VL 系列中，ViT 被深度改造并“LLM 化”，其职责是接收预处理后的视觉序列，通过 **32 层** 高度统一的 Transformer Block 深度堆叠，完成从“像素光影”到“高级语义（物体、动作、场景）”的跨越，为最终进入大语言模型（LLM）做好准备。
+在 Qwen2.5-VL 中，ViT 被深度改造并“LLM 化”。它的核心职责是接收由时空切块器（VisionPatchEmbed）吐出的局部物理特征序列，经过深达 **32 层** 的网络提纯，完成从“像素光影”到“高级语义意图（物体、动作、场景）”的跨越。
 
-### 渊源与演化：原始 ViT (2020) 的奠基流转
-![](<images/ViT(2020, Google Research)-image.png>)
-![](<images/ViT(2020, Google Research)-vit流程图.png>)
+### Qwen2.5-VL ViT 的全局宏观架构 (32层堆叠)
 
-原始 ViT 的架构完全复用了 NLP 领域的标准 Transformer Encoder：
-1. **Linear Projection (Patch Embedding)**：将二维图片切分成无重叠的 Patch，展平并通过全连接层映射为 1D Token 序列。
-2. **[CLS] Token 与 Positional Embedding**：在序列头部追加一个用于分类的 Token，并为所有 Token 加上 1D 可学习绝对位置编码。
-3. **Transformer Encoder**：由交替的 `LayerNorm -> Multi-Head Attention (MSA)` 和 `LayerNorm -> MLP (Inverted Bottleneck)` 组成，循环 $L$ 层。
-4. **MLP Head**：仅提取 `[CLS]` Token 的特征，用于图像分类。
+Qwen2.5-VL 的视觉骨干网并不是 32 个一模一样的块在做无脑重复。为了在超高动态分辨率下节省极大的 $O(N^2)$ 算力开销，它采用了**交错视野（Window vs Global）**的宏观架构设计。
 
-### 架构演化对比：Qwen2.5-VL 的“LLM 化”颠覆
-为了让视觉特征与语言大模型能够更顺畅地对接（降低跨模态对齐的“方言差”），Qwen 团队对 ViT 进行了彻底的改造：
+**整体架构串联与上下游 I/O 流转**：
+- **上游输入**：来自于时空切块器（`patch_embed`）的特征序列。例如一个 Batch 里的一张缩略图，被切分为 196 个 Patch，每个 Patch 被投影为 1152 维的向量。输入张量形状为 `[Batch, 196, 1152]`。
+- **架构配置**：总计 32 层（`num_hidden_layers = 32`）。
+- **交错规律**：
+  - 第 7, 15, 23, 31 层（共 4 层，`config.fullatt_block_indexes`）采用 **Global Attention（全局注意力）**。
+  - 其余 28 层全部采用 **Window Attention（窗口注意力）**。
+- **下游输出**：经过 32 层特征融合后，输出维度不改变，依然是 `[Batch, 196, 1152]`。随后被送入 `PatchMerger` 空间降维器。
 
-| 组件 | 原始 ViT (2020) | Qwen2.5-VL ViT | 演化本质与原理解读 |
-| :--- | :--- | :--- | :--- |
-| **位置编码** | 1D 可学习绝对位置，**直接加 (Add)** 在输入上。数学本质是 $W(I+P)=WI+WP$，相加等价于一种特殊的高效 Concatenate | **2D-RoPE**，在 Attention 内部进行复数旋转 | 绝对位置编码锁死了分辨率，2D-RoPE 天然支持任意分辨率和长宽比外推。 |
-| **全局聚合** | 依赖序列开头的 `[CLS]` Token | **抛弃 `[CLS]` Token**，全部 Token 降维后送入 LLM | MLLM 不需要做简单的图像分类，而是需要密集的局部和全局语义输入给 LLM。 |
-| **归一化策略** | LayerNorm | **RMSNorm** | 抛弃均值平移，与 Qwen2.5 文本端完全对齐，提升计算速度。 |
-| **非线性激活** | GELU | **SwiGLU (且 bias=True)** | 文本端使用无偏置 SwiGLU，视觉端为了对抗传感器直流偏移底噪开启偏置。 |
-| **注意力范围** | 每层都是全图 Global Attention | **Window Attention** 为主，1/8 的层穿插 Global | 在原生极高分辨率下，$O(N^2)$ 全图计算会 OOM，交错窗口既省算力又保住了宏观意图。 |
-
----
-
-## 核心底层神经元级别的微观放大镜 (Tensor Flow)
-
-为了破除“黑盒”迷信，我们以原始 ViT-Base 处理一张 $224 \times 224 \times 3$ 的图像为例，用显微镜观察数据在每一层神经元中的张量形变（Tensor Shape）。
-
-### 1. 物理切块与 Patch Embedding
-*   **输入**：Image $X \in \mathbb{R}^{B \times 3 \times 224 \times 224}$
-*   **动作**：使用 `kernel_size=16`, `stride=16` 的 2D 卷积核，将图像切分为 $14 \times 14 = 196$ 个 Patch。每个 Patch 区域（$16 \times 16 \times 3 = 768$ 个像素值）被映射为一个 768 维的向量。
-*   **张量形变**：`[B, 3, 224, 224] -> Conv2d -> [B, 768, 14, 14] -> flatten -> [B, 768, 196] -> transpose -> [B, 196, 768]`
-
-### 2. [CLS] 拼接与位置编码融合
-*   **[CLS] Token**：这是一个 `nn.Parameter(torch.randn(1, 1, 768))`，拓展到 Batch 后与 Patch 序列 `cat`，长度变为 197。`[B, 197, 768]`
-*   **位置编码**：生成一个形状为 `[1, 197, 768]` 的可学习参数。直接与输入相加 `x = x + pos_embed`。
-*   **第一性原理**：为什么要相加而不是 Concat？因为 $W(I+P) = WI+WP$，相加等效于在特征拼接后再做一次联合线性变换，既保留了空间信息，又极其节约显存。
-
-### 3. 多头注意力机制 (Multi-Head Attention, MSA) 的微观解剖
-这是 Transformer 的跨空间融合核心。
-*   **输入**：`X`，形状 `[B, 197, 768]`。
-*   **QKV 线性映射**：通过一个 `nn.Linear(768, 768*3)`，将输入扩展为 `[B, 197, 2304]`。
-*   **多头拆分**：将 2304 劈开为 Q, K, V。假设 Head=12，则每个 Head 的维度 `head_dim = 768/12 = 64`。
-    `[B, 197, 3, 12, 64] -> permute -> Q, K, V 分别为 [B, 12, 197, 64]`
-*   **注意力分数矩阵 (Attention Matrix)**：
-    计算 $Q \cdot K^T$：`[B, 12, 197, 64] @ [B, 12, 64, 197] -> [B, 12, 197, 197]`
-    这个 $197 \times 197$ 的矩阵就是全局注意力热力图。除以 $\sqrt{64}$ (Scale) 防止 Softmax 梯度消失，然后算 Softmax，得出权重。
-*   **特征加权 (Weighted Sum)**：
-    `[B, 12, 197, 197] @ [B, 12, 197, 64] -> [B, 12, 197, 64]`。随后把 12 个头拼回去，变回 `[B, 197, 768]`。
-*   **物理意义**：经过这一步，原本只代表“猫耳朵”的 Patch 向量内部，按照 Softmax 的权重，被狠狠地“混入”了“猫眼睛”和“猫尾巴”的数值。孤立的像素碎片演化成了连贯的“猫”。
-
-### 4. MLP 层：倒瓶颈结构 (Inverted Bottleneck) 的通道提纯
-如果说 Attention 是让所有 Token “串门互通”，那么 MLP 就是让每个 Token “关起门来内部消化”。
-*   **网络结构**：两层全连接层 `Linear(768, 3072) -> GELU -> Linear(3072, 768)`。
-*   **第一性原理 (倒瓶颈)**：不同于 ResNet 先降维再升维的 Bottleneck（为了省算力）。ViT 采用**先将通道数放大 4 倍，再缩减回来**的 Inverted Bottleneck 结构。这是因为在高维空间中，特征之间更容易被非线性激活函数（如 GELU/SwiGLU）解耦和过滤，从而极大地增强模型对复杂视觉概念的表达能力。
-
-### 5. 残差连接 (Residual) 与高速公路
-每一层 Attention 和 MLP 的外面都包着一个残差 `x = x + module(norm(x))`。
-*   **物理意义**：不仅防止了前向传播时原始物理像素特征在深层网络中丢失，更在**反向传播**中充当了“梯度高速分配器”，将 Loss 无损地传导回第一层的切块器，根绝梯度消失。
-
----
-
-## 核心源码解剖 (从原始 ViT 到 Qwen)
-
-要真正破除黑盒，没有什么比直接看 PyTorch 源码更直观的了。以下是基础组件的标准代码实现。
-
-### 1. 原始 ViT 的 Patch Embedding
-将卷积切图和张量重塑（展平、转置）一气呵成：
-```python
-class PatchEmbedding(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
-        super().__init__()
-        # 利用 2D 卷积的无重叠滑动，直接切出 Patch 并映射到 768 维
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x):
-        x = self.proj(x)      # [B, 3, 224, 224] -> [B, 768, 14, 14]
-        x = x.flatten(2)      # [B, 768, 14, 14] -> [B, 768, 196]
-        x = x.transpose(1, 2) # [B, 768, 196]    -> [B, 196, 768] (这就是标准的 Transformer 序列格式)
-        return x
+```mermaid
+graph TD
+    IN["上游输入: [Batch, Total_Patches, 1152]"] --> L1["Block 0-6: 连续 7 层 Window Attention (在 8x8 局部窗口内提纯边缘/纹理)"]
+    L1 --> L7["Block 7: Global Attention (打破局部限制，全图 Token 第一次大一统对话)"]
+    L7 --> L8["Block 8-14: 连续 7 层 Window Attention (在新的高级特征上再次进行局部组装)"]
+    L8 --> L15["Block 15: Global Attention (第二次全图语义拉通)"]
+    L15 --> L_MID["... 重复交错 ..."]
+    L_MID --> L31["Block 31: Final Global Attention (形成最终的宏观意图概念)"]
+    L31 --> NORM["Final RMSNorm 归一化"]
+    NORM --> OUT["下游输出: [Batch, Total_Patches, 1152] 送入 PatchMerger"]
 ```
 
-### 2. 原始 ViT 的多头注意力 (MultiheadAttention)
-重点观察 `qkv` 的剥离和最后合并多头的形变：
+---
+
+## 每一层 Block 的内部结构串联
+
+我们拿走上述 32 层中的任意一层（`Qwen2_5_VLVisionBlock`），用显微镜观察数据在它内部是如何流转的。
+每一层 Block 的内部结构极为统一，由两个“残差高速公路（Residual Path）”连接的子网络组成：
+1. **多头注意力子网络 (Multi-Head Attention)**
+2. **前馈神经网络子网络 (MLP)**
+
+**流转时序图**：
+![](<images/ViT(2020, Google Research)-encoder.png>)
+
+**代码与张量的上下游串联流转**：
+```python
+class Qwen2_5_VLVisionBlock(nn.Module):
+    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        # 【输入】 hidden_states: [Batch, 196, 1152]
+        
+        # ------------------ 第一条高速公路：注意力融合 ------------------
+        # 1. 过第一道门：RMSNorm 归一化。把特征的尺度拉平，防梯度爆炸。
+        normed_states_1 = self.norm1(hidden_states) 
+        # 2. 时空特征融合：根据配置（Window 还是 Global）划定注意力边界，注入 2D-RoPE。
+        attn_out = self.attn(normed_states_1, cu_seqlens, rotary_pos_emb) # 输出依然是 [Batch, 196, 1152]
+        # 3. 残差相加：将原始输入和融合后的增量相加。
+        hidden_states = hidden_states + attn_out 
+        
+        # ------------------ 第二条高速公路：通道提纯 ------------------
+        # 4. 过第二道门：再次 RMSNorm 归一化。
+        normed_states_2 = self.norm2(hidden_states)
+        # 5. 单个 Patch 的内部消化：过带有 Bias 的 SwiGLU MLP，进行非线性通道过滤。
+        mlp_out = self.mlp(normed_states_2) # 输出依然是 [Batch, 196, 1152]
+        # 6. 残差相加：产生这一层最终的特征。
+        hidden_states = hidden_states + mlp_out
+        
+        # 【输出】 交给下一层 Block 继续处理
+        return hidden_states
+```
+
+---
+
+## 核心组件一：多头注意力机制 (Multi-Head Attention) 深度解剖
+
+### 1. 说明与直观概念理解
+*   **说明**：如果说卷积只能看到周围 $3 \times 3$ 的几个像素，那么 Attention 机制则允许每一个 Patch 瞬间“凝视”整张图片上的所有其他 Patch（在 Global 层下）。
+*   **直观理解**：假设图片里有一只猫。代表“猫耳朵”的 Token 此时只是个三角形的边缘特征。通过 Attention，它向全图发出了“查询（Query）”：“谁长得像眼睛和尾巴，快把你们的特征给我！”。于是，“猫眼睛”和“猫尾巴”的 Token 将自己拥有的值（Value）按极高的权重传递给了“耳朵”。孤立的碎片在这一刻，发生了化学反应，拼凑成了“猫”。
+
+### 2. 第一性原理与算法公式推导
+注意力机制的本质是**相似度加权求和**。
+1.  **QKV 投影**：对输入序列 $X$ 进行三次不同的线性投影，得到 $Q$（我要找什么）、$K$（我拥有什么特征）、$V$（我的特征数值是多少）。
+2.  **相似度计算 (Dot Product)**：用所有的 $Q$ 去乘以所有的 $K^T$。这一步算出了一个庞大的 $N \times N$ 的相关性矩阵。
+3.  **缩放与归一化 (Scale & Softmax)**：除以 $\sqrt{d_k}$ 防止内积过大导致 Softmax 进入饱和区（梯度消失），再通过 Softmax 将所有相关性转换为加和为 1 的概率权重。
+4.  **加权求和**：用算好的权重矩阵去乘以对应的 $V$。
+$$ \text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{Q K^T}{\sqrt{d_k}}\right) V $$
+
+### 3. 多头拆分的物理形变与源码详解
+真实的 PyTorch 实现为了利用 GPU 并行，都是一次性生成 QKV，并利用 `reshape` 和 `transpose` 实现“多头”的魔法。我们以 `embed_dim=768, num_heads=12`，输入序列 `N=197` 为例进行显微镜级拆解：
+
 ```python
 class MultiheadAttention(nn.Module):
     def __init__(self, embed_dim=768, num_heads=12):
         super().__init__()
         self.num_heads = num_heads
-        self.scale = (embed_dim // num_heads) ** -0.5
-        # 一次性生成 Q, K, V
+        # 每个头的维度 head_dim = 768 / 12 = 64
+        self.scale = (embed_dim // num_heads) ** -0.5 # 1/sqrt(64) = 0.125
+        
+        # 1. 【参数定义】一刀切的 QKV 投影矩阵。768 维进去，出来 2304 维 (768*3)
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.out_linear = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x):
-        B, N, C = x.shape  # 例如 B, 197, 768
+        B, N, C = x.shape  # 例如 B=1, N=197, C=768
         
-        # 1. 映射并拆分为 3 份 (Q,K,V) 和多头 (heads)
-        # [B, 197, 3, 12, 64] -> permute -> [3, B, 12, 197, 64]
+        # ==================== 多头拆分形变 ====================
+        # 1. 经过 Linear 映射，得到 [B, 197, 2304]
+        # 2. 劈开成 3 份(Q/K/V)，以及 12 个头，每个头 64 维：reshape 得到 [B, 197, 3, 12, 64]
+        # 3. 把 '3(QKV)' 换到第 0 维，'12(多头)' 换到序列前面：permute 得到 [3, B, 12, 197, 64]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # 每个都是 [B, 12, 197, 64]
         
-        # 2. Q * K^T 计算热力图
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, 12, 197, 197]
-        attn = attn.softmax(dim=-1)
+        # 此时 q, k, v 各自的形状都是 [B, 12, 197, 64]
+        # 这意味着：对于 12 个头，每个头都有自己独立的一个 197 个 token 的序列，每个 token 只有 64 维特征。
+        q, k, v = qkv[0], qkv[1], qkv[2] 
         
-        # 3. 乘以 Value 并合并多头
-        # [B, 12, 197, 64] -> transpose -> [B, 197, 12, 64] -> reshape -> [B, 197, 768]
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # ==================== 注意力矩阵计算 ====================
+        # k.transpose(-2, -1) 将 k 从 [B, 12, 197, 64] 转置为 [B, 12, 64, 197]
+        # q @ k^T 计算内积：[B, 12, 197, 64] @ [B, 12, 64, 197] = [B, 12, 197, 197]
+        # 产生了一个 197x197 的热力图！这个图里的第 (i, j) 个数值，就代表第 i 个 patch 对第 j 个 patch 的关注度！
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1) # 在最后一个维度（行）上做概率归一化
         
-        # 4. 最终投影
+        # ==================== 特征混合与多头拼接 ====================
+        # 用 197x197 的注意力矩阵去乘以 V [B, 12, 197, 64]
+        # [B, 12, 197, 197] @ [B, 12, 197, 64] = [B, 12, 197, 64]
+        # 这一步极其神奇：每个 64 维的 v 向量，都已经被别人按比例狠狠“混入了”新的特征。
+        x_mixed = attn @ v
+        
+        # 将分离的 12 个头拼回一个完整的 768 维。
+        # 先 transpose(1, 2) 变为 [B, 197, 12, 64]
+        # 再 reshape 强行拍平最后两维 12*64 = 768。得到 [B, 197, 768]
+        x = x_mixed.transpose(1, 2).reshape(B, N, C)
+        
+        # ==================== 最终线性投影 ====================
+        # 通过最后一道门框，[B, 197, 768] 保持不变输出。
         return self.out_linear(x)
 ```
 
-### 3. Qwen2.5-VL 的视觉块 (Vision Block)
-Qwen 的架构中引入了动态窗口切换和 RMSNorm：
-**文件路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
-```python
-class Qwen2_5_VLVisionBlock(nn.Module):
-    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb):
-        # 1. 第一层归一化 + 注意力 (Residual Path 1)
-        # 注意：cu_seqlens 决定了视野是 Window 还是 Global；rotary_pos_emb 注入 2D-RoPE
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cu_seqlens, rotary_pos_emb
-        )
-        # 2. 第二层归一化 + MLP (Residual Path 2)
-        # 注意：视觉侧 MLP 开启了 bias=True 对抗底噪
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-```
+---
+
+## 核心组件二：MLP 前馈网络深度解剖
+
+### 1. 说明与直观概念理解
+如果说 Attention 是让所有 Patch “串门互通”，那么 MLP 就是让每个 Patch **“关起门来内部消化”**。
+MLP 在处理时，完全无视序列长度 N，它是对每一个 Token 独立的 768 维向量进行数学上的高维映射和非线性过滤。
+
+### 2. 第一性原理：倒瓶颈结构 (Inverted Bottleneck)
+*   **传统 ResNet 瓶颈 (Bottleneck)**：为了省算力，通常是先把 256 维用 1x1 卷积降到 64 维，处理完了再升回 256 维。
+*   **Transformer 的倒瓶颈**：先用 Linear 把特征从 768 维**极度膨胀**到 3072 维（通常是 4 倍），经过激活函数后，再压缩回 768 维。
+*   **原理解读**：高维空间具有极度稀疏的特性。当我们将纠缠在一起的 768 维复杂视觉特征强行拉入 3072 维的庞大空间时，特征的维度会被充分解耦。此时，非线性激活函数（如 GELU 或 SwiGLU）能像一把锋利的手术刀，轻易剔除掉不需要的底噪背景特征，只保留最尖锐的语义信号。
+
+### 3. Qwen2.5-VL 专属架构：带 Bias 的 SwiGLU
+在 Qwen 系列视觉骨干网中，采用的是 `SwiGLU` 而非传统的 `GELU`。
+并且，与文本大模型端（无偏置）不同，视觉端的 MLP **强行开启了偏置 `bias=True`**。因为图像来源于物理传感器的连续模拟信号，天生存在“直流偏移（DC Offset）”。开启 bias 能够极其廉价地对抗这种物理底噪，防止神经网络白白浪费大量神经元去拟合这部分无关常量。
 
 ---
 
@@ -164,27 +180,10 @@ class Qwen2_5_VLVisionBlock(nn.Module):
     *   无需保存梯度、优化器状态和长期的中间激活值。
     *   **半精度 (FP16/BF16)** 推理：显存消耗仅约为 $2M$ (GB)。
     *   **单精度 (FP32)** 推理：显存消耗约为 $4M$ (GB)。
-*(注：对于 LLM 还需要额外考虑 KV Cache 的巨大开销，但纯粹的 ViT 骨干网由于是一次性前向提取，不存在自回归过程，所以不产生 KV Cache 累积)*
-
----
-
-## 质量自我审查与准出标准
-
-1.  **流转张量看懂了吗？**：必须能闭眼描述出 `[B, 197, 768]` 是如何依次在 MSA 内部劈开成多头计算 Attention，再在 MLP 中膨胀 4 倍又收缩回来的。
-2.  **融合机制清楚了吗？**：能解释 Attention 是如何通过 $QK^T$ 让一个 Patch 获取全局特征的，而 MLP 只是在单个 Patch 内部混合通道。
-3.  **理解反向传播的高速公路了吗？**：知道在 32 层深的网络中，残差连接是如何保证梯度不消失的。
 
 ---
 
 ## 关联概念
-
 - [[conv3d_时空切块器]]：Qwen 体系下的上游输入，提供原始 5D 时空嵌入。
-- [[window_attention_交错注意力]]：核心注意力机制升级，实现算力节省。
-- [[swiglu_门控激活函数]]：核心非线性单元，负责特征过滤。
-- [[rmsnorm_归一化]]：数值稳定性的基石。
-- [[patchmerger_空间降维]]：下游衔接，将提纯后的 32 层特征进行最后的 4 倍压缩。
-
-## 参考来源
-- 论文：*An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (2020)*
-- 原始资料：`knowledge_base/raw/ViT(2020, Google Research)/ViT(2020, Google Research).md`
-- `knowledge_base/raw/万字长文图解Qwen2.5-VL实现细节_猛猿_2025-06-25/index.md`
+- [[window_attention_交错注意力]]：核心注意力机制在超高分辨率下的妥协演进。
+- [[rmsnorm_归一化]] / [[swiglu_门控激活函数]]：模型向 LLM 化看齐的核心算子。

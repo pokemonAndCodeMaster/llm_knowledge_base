@@ -167,6 +167,10 @@ sequenceDiagram
 #### 3.1 关于原生动态分辨率
 *   **Q1: Qwen2.5-VL 采用了 NaViT 的动态分辨率，那它也使用了 Token Drop 机制来随机丢弃 Token 吗？**
     👉 解答详见：[[qwen2.5_vl_预处理流水线#步骤一：图像的配置检查与限界缩放 (smart_resize)]]
+*   **Q2: 把多张不同尺寸的图片 Pack 到同一个序列中，计算 Attention 时怎么保证它们不互相污染？**
+    👉 解答详见：[[navit_动态分辨率#1-navit-的基石思想-patch-n-pack]]
+*   **Q3: 相比于基于切片的动态分辨率（如 InternVL2），原生动态分辨率（如 Qwen2-VL）的 Token 消耗真的更少吗？**
+    👉 解答详见：[[navit_动态分辨率#原生-qwen-vs-切片-internvl：token-消耗对决]]
 
 #### 3.2 关于配置管理与参数计算
 *   **Q2: 配置文件中没有 `max_token`，那是怎么通过 `max_pixels` 和 `min_pixels` 实现原生限制 Token 数量的？**

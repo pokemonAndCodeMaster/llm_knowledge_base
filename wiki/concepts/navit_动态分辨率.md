@@ -1,266 +1,200 @@
 ---
-title: NaViT 原生动态分辨率 (Native Resolution ViT)
-tags: [概念, 视觉编码器, 动态分辨率, ViT, Qwen2.5-VL]
+title: 动态分辨率输入方案与 NaViT (Native Resolution ViT)
+tags: [概念, 视觉编码器, 动态分辨率, ViT, Qwen2.5-VL, InternVL, Token压缩]
 created: 2026-05-03
-updated: 2026-05-03
-sources: 3
+updated: 2026-05-04
+sources: 4
 status: active
 ---
 
-# NaViT 原生动态分辨率 (Native Resolution ViT)
+# 动态分辨率输入方案与 NaViT
 
-## 模块整体说明
+## 模块整体说明与架构拆解
 
-NaViT（Native Resolution ViT）是 Google 于 2023 年提出的视觉 Transformer 改进方案（论文：*Patch n' Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution*，arXiv: 2307.06304）。
+在传统的多模态大模型（如早期 LLaMA, Qwen-VL）中，视觉编码器使用的是标准 ViT 架构，所有的输入图像都必须强行缩放（Resize）到固定的分辨率（通常是正方形，如 224×224 或 336×336）。
 
-**它解决的核心问题**是：以往所有 ViT 模型都要把输入图片强行 Resize 到固定分辨率（如 224×224），这会导致两个严重问题——（1）低分辨率丢失细节，无法识别小字和细节图表；（2）固定宽高比引入形变，长条形文档被压成正方形。NaViT 主张**保持图像的原始分辨率和宽高比**，直接处理任意尺寸的图像。
+**传统固定分辨率的致命缺陷**：
+1. **低分辨率丢失细节**：无法识别小字和复杂的细节图表。
+2. **固定宽高比引入形变**：长条形文档被强行压成正方形，导致图片严重扭曲失真，引入了误导信息。
+![](<images/v2-2cf8b180535c98cf530f10744213d57b_r.jpg>)
 
-**直观比喻**：传统 ViT 就像一个只有一种尺寸模具的饼干工厂，不管面团什么形状都往同一个方模具里硬塞。NaViT 则换成了一把可调节的切刀——面团多大就按多大切，只要切成统一大小的小方块（Patch），流水线就能正常工作。
+为了解决这个问题，业界演化出了两大高颗粒度的动态分辨率流派：**原生动态分辨率 (Native Dynamic Resolution, 以 NaViT 和 Qwen2-VL 为代表)** 和 **基于切片的动态分辨率 (Dynamic Tiling, 以 InternVL 为代表)**。
 
-**在 Qwen 系列中的地位**：NaViT 思想首先被 Qwen2-VL 引入其 ViT 中，随后在 [[qwen2.5_vl_技术报告解析]]、Qwen3-VL 和 Qwen3.5 中持续沿用，是 Qwen 全系视觉编码器的基石。它属于 [[动态分辨率方案对比]] 中的"原生动态分辨率"路线。
-
----
-
-## 核心算法原理详解
-
-### 1. 为什么传统 ViT 必须固定分辨率？
-
-要理解 NaViT 的价值，必须先理解传统 ViT 为什么被锁死在固定分辨率上。
-
-原始 ViT（2020, Google Research）使用了一个**可学习的 1D 绝对位置编码（Absolute Positional Embedding）**。在 Transformer 前置的 Embedding 阶段，这个位置编码向量和 Patch 向量直接相加组成输入。
-
-**关键约束**：可学习 Embedding 的尺寸（序列长度）在初始化时就固定了（比如 256 个位置）。这意味着推理时必须以相同的尺寸组织输入，分辨率就被锁死了。例如 Patch 大小为 14×14，图像必须是 $224 \times 224$（得到 $16 \times 16 = 256$ 个 Patch），否则位置编码的维度就对不上。
-
-**NaViT 的突破**：把位置编码从"预先固定的可学习向量"换成**分解式位置编码**，不再与固定序列长度绑定。在 Qwen 的实现中，则进一步替换为 [[2d_rope_视觉位置编码]]（2D-RoPE），基于位置动态计算旋转角度，彻底不需要预先固定序列长度。
-
-### 2. Patch n' Pack：序列打包训练
-
-**来龙去脉**：当图像不再被 Resize 到统一尺寸时，不同图像产生的 Patch 数量不同，无法直接组成一个 Batch 进行并行训练。NaViT 提出了 **Patch n' Pack** 方案——将多个图片按各自原始分辨率做 Patch 处理后，**拼接到同一个序列中**，填满一个固定长度的序列窗口。
-
-**直观比喻**：这就像邮局把大小不同的包裹塞进同一个集装箱——先塞大包裹，剩余空间塞小包裹，最后用填充物（Padding）塞满。
-
-**具体数值示例**：假设序列窗口容量为 256 个 Token：
-- 图像 A（320×640）→ 产生 $(320/14) \times (640/14) ≈ 22 \times 45 = 990$ 个 Patch → 做 Token Dropping 后保留 150 个
-- 图像 B（224×224）→ 产生 $16 \times 16 = 256$ 个 Patch → 做 Token Dropping 后保留 80 个
-- 图像 C（112×112）→ 产生 $8 \times 8 = 64$ 个 Patch → 不 Drop，保留 26 个
-- 三张图打包后总计 $150 + 80 + 26 = 256$，刚好填满序列窗口。
-
-### 3. 掩码注意力和掩码池化 (Masked Self Attention & Masked Pooling)
-
-多个 example 打包到同一个序列后，在 Transformer 的每一层做 Self-Attention 时，**不同 example 之间不能互相 Attention**，否则会产生信息泄露。
-
-**解决方案**：引入一个额外的**对角分块 Mask 矩阵**（Block-Diagonal Attention Mask）。
-
-**数值示例**：假设一个序列有三个 example，token 长度分别为 `4, 6, 5`，最后补 2 个 Padding Token 对齐到 17：
-
-```
-Attention Mask (17×17):
-[1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0]  ← example 1 (token 0-3)
-[1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0]
-[1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0]
-[1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0]
-[0 0 0 0 1 1 1 1 1 1 0 0 0 0 0 0 0]  ← example 2 (token 4-9)
-... (以此类推)
-[0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 0 0]  ← example 3 (token 10-14)
-[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]  ← padding (全 0)
-[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
-```
-
-同理，做 Pooling（计算 Loss）时也需要用相同的 Mask 矩阵做隔离，防止不同 example 的特征被混合池化。
-
-### 4. 分解式位置编码 (Factorized & Fractional Positional Embeddings)
-
-NaViT 对位置编码做了关键的分解改进：
-
-| 方案 | 位置编码 | 参数量 | 外推性 |
-|------|---------|--------|--------|
-| 原始 ViT | 可训练 1D 绝对位置编码 | $maxLen$ | 差（只见过固定长度） |
-| Pix2struct | 可学习 2D 绝对位置编码 | $maxLen^2$ | 差（每个 $(x,y)$ 都要被学过） |
-| **NaViT** | **分离式位置编码** | $2 \times maxLen$ | **好**（X 和 Y 独立学习） |
-
-**为什么外推性好？** 虽然 $(a, b)$ 这个分辨率组合没见过，但高为 $a$ 的图片和宽为 $b$ 的图片模型可能分别都见过，X 轴和 Y 轴的位置编码是各自独立学习的。
-
-**在 Qwen 中的进化**：Qwen 系列没有直接用 NaViT 的分解式可学习编码，而是更进一步，采用了 [[2d_rope_视觉位置编码]]（2D-RoPE）。RoPE 完全不需要可学习参数，位置信息通过旋转矩阵的角度来编码，天然支持任意长度外推。
-
-### 5. Continuous Token Dropping（连续 Token 丢弃）
-
-**来龙去脉**：图像本身是低密度的信息载体。空间临近的像素和 Patch 之间有大量冗余信息。在训练时，可以通过适当的采样丢弃一些 Patch，提高训练吞吐和性能。
-
-**NaViT 的创新**：由于多个 image 被 Pack 到一个序列里，每个图片可以有不同的 Drop Rate。对于大尺寸图片，可以提升 Drop Rate 来压缩序列特征长度；为了控制 Sequence 总长度，可以对最后一个图片做特化的采样策略（根据剩余容纳空间来调整），从而控制多 image 拼接后得到固定的 Sequence 长度。
-
-### 6. Resolution Sampling（分辨率采样）
-
-NaViT 允许对图像尺寸进行**混合分辨率采样**，同时保留原始纵横比。
-
-传统 ViT 的权衡：小图训练 → 高吞吐量 → 但推理分辨率受限；大图训练 → 分辨率高 → 但吞吐量低。通常先小分辨率预训练，再高分辨率微调。
-
-NaViT 可以在单个 Batch 中混合不同分辨率的图像，兼顾高吞吐量与大尺寸图像训练。
-
----
-
-## 架构与代码流程图
-
+### 架构演进流转图示
 ```mermaid
 graph TD
-    A["多张不同分辨率图像"] --> B["保留原始分辨率做 Patch 切分"]
-    B --> C["每张图独立做 Token Dropping"]
-    C --> D["Patch n' Pack: 拼接到一个固定长度序列"]
-    D --> E["生成分块对角 Attention Mask"]
-    E --> F["ViT Transformer 前向计算"]
-    F --> G["分块 Masked Pooling 出各图特征"]
-```
-
-### 6. Qwen2.5-VL 实际工程实现：从 NaViT 思想到代码
-
-> **本节是 NaViT 思想在 Qwen2.5-VL 中的完整落地**。对应学习指南 **[§2.3 NaViT 动态网格的四步流水线详解](../synthesis/qwen2.5_vl_深度剖析学习指南.md#23-navit-动态网格的四步流水线详解)** 的详细代码展开。
-
-#### 6.1 为什么是 factor=28 而不是 14？
-
-NaViT 思想要求 H/W 能整除 `patch_size`（14）。但 Qwen2.5-VL 在 Processor 里用的是 `factor=28`：
-
-$$factor = patch\_size \times spatial\_merge\_size = 14 \times 2 = 28$$
-
-原因：`PatchMerger` 会在视觉 token 进入 LLM 前做 2×2 空间合并。为了保证合并后 token 数是整数，从源头就要求 H/W 能整除 28。
-
-#### 6.2 smart_resize：尺寸对齐实现
-
-**代码路径**：`transformers/src/transformers/models/qwen2_5_vl/image_processing_qwen2_5_vl.py`
-
-```python
-def smart_resize(
-    height: int,
-    width: int,
-    factor: int = 28,
-    min_pixels: int = 56 * 56,
-    max_pixels: int = 14 * 14 * 4 * 1280,
-) -> tuple[int, int]:
-    """
-    将 (height, width) 调整为 factor 的整数倍，同时控制总像素数在 [min_pixels, max_pixels] 范围内。
-    保持原始宽高比。
-    """
-    # 1. 计算当前像素数，如果超出范围则等比缩放
-    if height * width > max_pixels:
-        scale = math.sqrt(max_pixels / (height * width))
-        height = int(height * scale)
-        width  = int(width  * scale)
-    elif height * width < min_pixels:
-        scale = math.sqrt(min_pixels / (height * width))
-        height = int(height * scale)
-        width  = int(width  * scale)
-
-    # 2. Pad 到 factor 整数倍（向上取整）
-    height = math.ceil(height / factor) * factor   # e.g. 100 → 112
-    width  = math.ceil(width  / factor) * factor   # e.g. 200 → 210
-    return height, width
-```
-
-**数值示例对比**：
-
-| 原始尺寸 | smart_resize 后 | 网格 H'×W' | LLM Token 数 |
-|---------|----------------|------------|------------|
-| 8204×1092 | 8204×1092（整除） | 586×78 | **11427** |
-| 28×224 | 28×224（整除） | 2×16 | **8** |
-| 100×200 | 112×210 | 8×15 | **30** |
-| 1080×1920 | 1092×1932 | 78×138 | **2697** |
-
-#### 6.3 Padding 的物理实现
-
-在 PIL/torchvision 层面，Padding 通过先 resize 再 pad 完成：
-
-```python
-# 在 ImageProcessor.preprocess() 中
-image = resize(image, size=(new_h, new_w), ...)  # Bicubic 插值缩放
-# 如果 resize 后尺寸与目标不完全相同（浮点误差），补黑色边缘
-if image.size != (new_w, new_h):
-    padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))  # 黑色背景
-    padded.paste(image, (0, 0))  # 将图粘贴到左上角，右/下边自动是黑
-    image = padded
-```
-
-#### 6.4 帧复制与时间对齐（视频专属）
-
-```python
-# 代码路径：image_processing_qwen2_5_vl.py -> process_video()
-def process_video(frames, temporal_patch_size=2, ...):
-    num_frames = len(frames)
-    # 若帧数不是 temporal_patch_size 的整数倍，补最后一帧
-    if num_frames % temporal_patch_size != 0:
-        pad_count = temporal_patch_size - (num_frames % temporal_patch_size)
-        frames = frames + [frames[-1]] * pad_count
-
-    # 若是静态图（1帧），复制为 temporal_patch_size 帧
-    if num_frames == 1:
-        frames = frames * temporal_patch_size  # [frame, frame]
+    A["任意长宽比的高清图像"] --> B{"动态分辨率流派选择"}
     
-    return frames  # 长度一定是 temporal_patch_size 的整数倍
+    B -->|"流派一: 原生整体缩放 (Native)"| C1["按原始长宽比缩放至限制像素内"]
+    C1 --> C2["切分出数量不等的 Patch 序列"]
+    C2 --> C3["序列长度不一，需做 Batch 内 Padding 及 Mask 隔离"]
+    C3 --> C4["2D-RoPE 注入动态位置信息，独立或打包送入 ViT"]
+    
+    B -->|"流派二: 网格切片 (Tiling)"| D1["根据宽高比匹配最佳固定网格 (如 3x2)"]
+    D1 --> D2["切分出 6 个固定分辨率的 Tile 局部高清块"]
+    D2 --> D3["(加持) 额外保留一张全图缩略图 (Thumbnail)"]
+    D3 --> D4["复用传统绝对位置编码，7 个块独立通过 ViT"]
 ```
 
-#### 6.5 image_grid_thw：网格元数据张量
+---
 
-Processor 输出的 `image_grid_thw` 是模型理解视觉结构的关键辅助信息：
+## 核心算法原理详解：流派一 - 原生动态分辨率 (NaViT 与 Qwen)
 
+### 1. NaViT 的基石思想 (Patch n' Pack)
+Google 的 NaViT (*Patch n' Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution*) 首次提出了保留原始分辨率的做法。
+
+**打包原理 (Sequence Packing)**：
+由于不改变宽高比，每个图像产生的 Patch 数量是不同的。传统 ViT 必须输入定长序列，为了高效训练且不浪费算力，NaViT 采用了 **Patch n' Pack** 策略：将多个长度不同的图像 Patch 序列拼接到同一个 Batch 序列中，填满窗口。
+![](<images/NaViT-截屏2025-03-27 18.09.52-1.png>)
+
+**计算隔离的魔法 (Block-Diagonal Attention Mask)**：
+把多张图塞进一个序列，在 Transformer 计算 Self-Attention 时绝对不能互相“串门”。这需要极其精细的**对角分块 Mask 矩阵**。
+假设 5 张图（Patch长度分别为 2, 3, 4, 5, 6）打包成 2 个序列 $S_1=\{I_1:2, I_2:3, I_3:4\}$ (长 9) 和 $S_2=\{I_4:5, I_5:6\}$ (长 11)。
+首先在 Batch 内做 Padding 对齐到 11：
+![](<images/v2-26610cb0c9e5c4b2c02f0077388b450d_r.jpg>)
+
+接着生成 Mask 矩阵：遍历每个序列，只有属于同一张图的起止区间内的元素置为 1，其余全为 0。
+![](<images/v2-db47e63ac494a5975678c4ad70df0929_r.jpg>)
+这样，矩阵对角线上就形成了独立的块，完美隔离了不同图像的 Attention 计算。
+
+### 2. 连续 Token 丢弃与分辨率采样 (NaViT 特有)
+- **Continuous Token Dropping**：图像本身信息密度低。NaViT 允许在 Packing 时，对不同大小的图片采用不同的 Drop Rate 丢弃 Patch。为了凑够固定序列长度，甚至可以对最后一张图进行自适应丢弃。
+![](<images/NaViT-截屏2025-03-27 19.18.59.png>)
+- **Resolution Sampling**：NaViT 允许在单个 Batch 内混合不同分辨率的图像（高吞吐量小图 + 强细节大图），而传统 ViT 只能先小图预训练再大图微调。
+
+### 3. Qwen2-VL 的源码落地与张量流转
+Qwen2.5-VL 并没有采用复杂的 Patch n' Pack 和 Token Drop，而是采用了更简单的“Padding 补齐法”，但其处理动态分辨率的核心步骤分为四步：
+
+**第一步：Smart Resize 寻找最近的 28 的倍数**
+因为下游有一个 `PatchMerger` 会把 2x2 个 $14 \times 14$ 的 Patch 合并，所以宽和高必须被 28 整除。
 ```python
-# shape: [N_media, 3]，每行是 [T, H', W']
-# T = num_frames / temporal_patch_size
-# H' = H_pad / patch_size
-# W' = W_pad / patch_size
+# min_pixels 控制下限，max_pixels 控制显存上限
+factor = 28
+h_bar = round(height / factor) * factor
+w_bar = round(width / factor) * factor
 
-image_grid_thw = torch.tensor([
-    [1, 586, 78],   # Picture 1: T=1, H'=586, W'=78
-    [1,   2, 16],   # Picture 2: T=1, H'=2,   W'=16
-])
-video_grid_thw = torch.tensor([
-    [2,  28, 46],   # Video 1:   T=2, H'=28,  W'=46
-])
-# 这些张量用于：
-# 1. get_rope_index() 计算 MRoPE 位置 ID
-# 2. VisionTransformer 内部知道每个 media 的空间结构
-# 3. Processor 计算需要插入多少个 <|image_pad|> 占位符
-#    n_pads = T × H' × W' / spatial_merge_size^2 = T × H' × W' / 4
+if h_bar * w_bar > max_pixels:
+    beta = math.sqrt((height * width) / max_pixels)
+    h_bar = math.floor(height / beta / factor) * factor
+    w_bar = math.floor(width / beta / factor) * factor
 ```
 
+**第二步：Rescale 与 Normalize**
+```python
+# rescale_factor = 1/255 (0.00392156)
+image = self.rescale(image, scale=rescale_factor)
+image = self.normalize(image=image, mean=image_mean, std=image_std)
+```
+
+**第三步：多帧堆叠凑时间步 (针对单图)**
+为了适配 3D 卷积（时间步默认 = 2），单张图会被复制一份：
+```python
+patches = np.tile(patches, (self.temporal_patch_size, 1, 1, 1))
+```
+
+**第四步：底层张量重组代码 (Conv2d -> Transformer Token)**
+![](<images/v2-ba939cfaf81cda98fb101ef8f27ac861_r.jpg>)
+图像是如何变成一维序列的？底层代码如下：
+```python
+class VisionTransformer(nn.Module):
+   def __init__(self, ...):
+       # 用卷积核实现无重叠滑动切块
+       self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+   def forward(self, x: torch.Tensor):
+        # 假设输入是一张 [3, 448, 448] 的图，输出通道 width=1664, patch_size=14
+        # 1. 卷积映射成 [1664, 32, 32] 的 3D 特征图 (32=448/14)
+        x = self.conv1(x)  
+        # 2. 按行展开：[1664, 32, 32] 映射成 [1664, 32*32=1024]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  
+        # 3. 维度转置：变成标准的 Token 序列格式 [1024, 1664]
+        x = x.permute(0, 2, 1)  
+        # 4. 增加 2D-RoPE 位置编码 (Qwen 用 RoPE 替代了原始的绝对位置加法)
+        x = x + get_abs_pos(self.positional_embedding, x.size(1))
+        x = self.transformer(x)
+```
+![](<images/v2-aca2be2159b5cc63a271af2b396681ac_r.jpg>)
+![](<images/v2-2533d36a743afa5cc473d10a84e0644c_r.jpg>)
+
 ---
 
-## 7. 动态分辨率方案深度对比：原生 vs 切片 (Tiling)
+## 核心算法原理详解：流派二 - 基于切片的动态分辨率 (Dynamic Tiling)
 
-在业界，除了 Qwen 采用的 NaViT 原生方案外，还有另一大流派：**基于切片的动态分辨率 (Dynamic Tiling)**。
+以 InternVL2.5 为例，它的逻辑比 Qwen 复杂，被称为 **Dynamic High Resolution**。
+![](<images/面试官：VLM 的动态分辨率是怎么做的？ -截屏2025-04-16 08.18.20.png>)
 
-| 维度 | Qwen系列 (Native Dynamic Resolution) | InternVL / LLaVA-NeXT (Dynamic Tiling) |
-| :--- | :--- | :--- |
-| **核心思想** | **整体缩放**：根据长宽比等比缩放至限制范围内，直接将整图视为一个超大的 Patch 网格。 | **拼图切片**：根据长宽比，将图像切分为若干个固定的方块（如 448x448），再加一张全局缩略图。 |
-| **位置编码** | 必须抛弃绝对位置，改用 **2D-RoPE**。 | 可以复用现成的绝对位置编码（因为每个 Tile 尺寸固定）。 |
-| **Batch 处理** | 不同图片产生的 Token 序列变长，需要复杂的 Padding 或 **Patch n' Pack** 以及对角 Attention Mask 隔离。 | 每个 Tile 尺寸一致，切块过程如同生成一个标准的 Batch，处理更为规整。 |
-| **局部细节** | 取决于 `max_pixels` 的上限设置。 | 切片可以切出极高分辨率的局部块，局部清晰度极高。 |
-| **全局关系** | ViT 的 Attention 是在全图计算的，不会割裂。 | Tile 之间被物理割裂了，需要依赖额外的缩略图 (Thumbnail) 提供宏观语义。 |
-| **Token 消耗** | 相对较少（仅为长宽网格数）。 | 消耗极大（尤其是带重叠的切片 + 缩略图，动辄数千上万 Token）。 |
+### 1. 寻找最匹配的宽高比 (Find Closest Aspect Ratio)
+InternVL 预定义了 35 组不同的宽高比（最极限的是 1:12，例如 `[(1,1), (1,2), (2,1), (3,1)...]`）。
+假设输入图像是 `1224 x 926`。
+算法会计算它的宽高比 $1224 / 926 \approx 1.32$，在 35 组中寻找最接近的，发现是 `4:3`。
+假设基础块尺寸 `image_size = 448`，则目标尺寸被强行 Resize 到：
+`target_width = 448 * 4 = 1792`
+`target_height = 448 * 3 = 1344`
 
-*注：两种方案各有优劣，Qwen 的原生方案在架构上更简洁统一，而 Tiling 方案在复用开源 ViT 权重和工程落地（不挑显卡框架）上更讨巧。*
+### 2. 切块 (Crop) 与 缩略图 (Thumbnail)
+将 Resize 后的 `1792 x 1344` 图片切成 $4 \times 3 = 12$ 个不重叠的 `448 x 448` 的局部高清块。
+```python
+# 得到没有 overlap 的 crop 块
+# 第0个patch (0, 0, 448, 448)
+# 第1个patch (448, 0, 896, 448)
+# 第2个patch (896, 0, 1344, 448)
+# ...以此类推到第11个patch
+```
+**关键补丁 (Thumbnail)**：为了不丢失全局宏观视野，还会把原图暴力 Resize 出一张额外的 `448 x 448` 缩略图。
+![](<images/面试官：VLM 的动态分辨率是怎么做的？ -MQzWbF6FfoGRd4x4qcCcopc6nzb.png>)
+
+**堆叠**：这 12+1=13 个块，会被 `torch.stack` 堆叠成 `[13, 3, 448, 448]` 的像素输入。它们会作为 13 张独立的图通过传统的 ViT 编码器。由于每个块尺寸都是死板的 448，所以**完美复用了传统的绝对位置编码**。
 
 ---
 
-## 8. 视觉 Token 压缩技术 (Vision Token Compression)
+## 原生 (Qwen) vs 切片 (InternVL)：Token 消耗对决
 
-原生支持动态高分辨率后，不可避免地带来了“**Token 数量爆炸**”的副作用（一张 4K 图可能产生上万个 Token），这会迅速耗尽 LLM 的上下文窗口。为此，催生了视觉 Token 压缩技术，目前有四大流派：
+我们来算一笔硬核的帐。同样一张 `1224 x 926` 的图片，谁更耗显存？
 
-1.  **基于变换 (Transformation-based)**：如 Qwen2.5-VL 使用的 [[patchmerger_空间降维]] (2x2 合并) 或 InternVL 的 Pixel Unshuffle。简单高效，能保留结构，但压缩率是写死的。
-2.  **基于相似性 (Similarity-based)**：利用余弦相似度，将背景中长得一样的天空或白墙 Token 融合（如 ToMe）。
-3.  **基于注意力 (Attention-based)**：利用 ViT 内部的 Attention 权重，直接剪枝掉模型不关注的背景 Token（如 FastV）。
-4.  **基于查询 (Query-based)**：用少量的可学习 Query 向量，通过 Cross-Attention 去主动提取图像特征（如 BLIP-2 的 Q-Former 或早期的 Qwen1-VL）。压缩率极高，但有丢失细粒度信息（如密集文字 OCR）的风险。
+### 1. Qwen2-VL 的消耗
+1. 经过 `smart_resize` 对齐 28 的倍数，重塑为 `1232 x 924`。
+2. 喂给 Vision Encoder，最后有一个 2x2 的 PatchMerger 压缩。
+3. 最终产生的 Token 数：$(1232 / 28) \times (924 / 28) = 44 \times 33 = \mathbf{1452}$ 个 Token。
+4. Token 的维度：Qwen 的视觉隐藏层极大，输出通道维度是 $\mathbf{3584}$。
+5. **Embedding 显存占用**：$1452 \times 3584 = \mathbf{5,203,968}$ 个数值。
+
+### 2. InternVL2.5 的消耗
+1. 切分出 13 个 `448 x 448` 的块。
+2. 每个块内部经过 ViT 下采样 16 倍，变成 $28 \times 28 = 784$。再经过 InternVL 自己的特征融合层（类似 MLP Merger），$28 \times 28$ 被压缩成 256。
+3. 最终产生的 Token 数：$13 \times 256 = \mathbf{3328}$ 个 Token。
+4. Token 的维度：InternVL 将其投射到了 $\mathbf{896}$ 维。
+5. **Embedding 显存占用**：$3328 \times 896 = \mathbf{2,981,888}$ 个数值。
+
+**震撼反直觉结论**：虽然 Qwen 只是一张图，而 InternVL 切了足足 13 块，但由于 Qwen 的通道维度过大（3584 vs 896），实际上 Qwen 消耗的 Embedding 显存**更大**！不过，Qwen 可以通过缩小 `max_pixels` 轻松反超，且原生方案没有切片边缘的割裂感。
 
 ---
+
+## 视觉 Token 压缩技术 (Vision Token Compression)
+
+引入动态高分辨率后，不可避免地带来了“**Token 数量爆炸**”的副作用（一张高清图动辄上万 Token），这会迅速耗尽 LLM 的上下文窗口。为此，催生了四大视觉 Token 压缩流派：
+![](<images/面试官：VLM 的动态分辨率是怎么做的？ -截屏2025-12-18 01.36.25.png>)
+
+1.  **基于变换 (Transformation-based)**：将特征按物理空间重塑变得紧凑。
+    *   代表：Qwen2.5-VL 的 `PatchMerger` (2x2 合并降维)，InternVL 的 `Pixel Unshuffle`。
+    *   优劣：保留视觉物理空间结构，但压缩率是死板固定的。
+2.  **基于相似性 (Similarity-based)**：利用余弦相似度，把背景中长得一样的天空或白墙 Token 在隐空间合并。
+    *   代表：ToMe, FOLDER (在 ViT 输出聚类或各层渐进合并)。
+    *   优劣：压缩率灵活；但可能误伤小字等细粒度信息，且破坏了空间结构。
+3.  **基于注意力 (Attention-based)**：利用注意力稀疏性进行剪枝。只保留 Attention 热力图中高亮的 Token。
+    *   代表：FastV (在 LLM 中剪枝), VisionZip (基于 ViT CLS 剪枝)。
+    *   优劣：解释性极强，动态剪裁；但需要显式计算注意力分数，需魔改底层加速框架。
+4.  **基于查询 (Query-based)**：基于文本查询指导信息蒸馏。用极少量的“探针（Query）”去交叉提取巨大的图像特征。
+    *   代表：BLIP-2 的 `Q-Former`，Qwen1-VL 的单层 Cross-Attention。
+    *   优劣：极限精炼压缩，适合视频；但在多轮对话中会反复重新编码，不适合密集文字。
+
+---
+
+## 质量自我审查与准出标准
+1. **Mask 隔离懂了吗？**：必须能默写出 NaViT 打包了不同长度图片的 Batch 后，其对角块状 Attention Mask 是如何分布防止污染的。
+2. **切片逻辑清楚吗？**：能画出 InternVL 是怎么从宽高比匹配出最接近的网格，推导出 12 个 Tile，并必然加上 1 个 Thumbnail 防止全局语义丢失的。
+3. **张量对决明白了吗？**：理解为什么单张图的 Qwen 的 Embedding 体积，因为 3584 维度的原因，反而超过切了 13 块的 InternVL。
+4. **底层重排代码理解了吗？**：能写出 `Conv2D` 卷积完后 `reshape -> permute` 转为 Transformer 1D 序列的过程。
 
 ## 关联概念
-
-- ✅ 支持 [[qwen2.5_vl_技术报告解析]]：Qwen2.5-VL 的视觉编码器核心理念来源于 NaViT。
-- ✅ **实际落地示例**：[学习指南 §2.3 NaViT 动态网格的四步流水线详解](../synthesis/qwen2.5_vl_深度剖析学习指南.md#23-navit-动态网格的四步流水线详解)（含官方 Picture 1/2/Video 1 的真实张量推导）
-- ✅ 支持 [[动态分辨率方案对比]]：NaViT 是"原生动态分辨率"路线的代表。
-- [[2d_rope_视觉位置编码]]：Qwen 系列中替代 NaViT 原始分解位置编码的技术方案。
-- [[conv3d_时空切块器]]：在 NaViT 动态网格之上进行实际的 Patch 切分。
-- [[patchmerger_空间降维]]：在 NaViT 产生的变长视觉 Token 之后进行 4× 空间压缩。
-
-## 参考来源
-
-- 论文：*Patch n' Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution* (arXiv: 2307.06304)
-- 原始资料：`knowledge_base/NaViT/NaViT.md`
-- 原始资料：`knowledge_base/面试官：VLM 的动态分辨率是怎么做的？/`
-- 代码路径：`transformers/src/transformers/models/qwen2_5_vl/image_processing_qwen2_5_vl.py`
+- ➡️ 下游的极致变换压缩：[[patchmerger_空间降维]]
+- ➡️ Qwen 原生位置编码的革命基石：[[2d_rope_视觉位置编码]]

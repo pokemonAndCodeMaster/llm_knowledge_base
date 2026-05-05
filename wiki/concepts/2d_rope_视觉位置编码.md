@@ -55,16 +55,26 @@ graph TD
 
 ## 核心算法原理详解
 
-### 1. 维度的一分为二
+### 1. 维度的一分为二与矩阵推导
 
 为什么要把 `head_dim` 分成两半？
-这是 2D-RoPE 的最核心思想。假设 `head_dim = 72`：
+这是 2D-RoPE 的最核心思想。假设 `head_dim = 72`，在概念上：
 *   **前 36 维 (X 轴)**：负责编码该 Patch 位于第几**列**。它只关心 $x$ 坐标，不受 $y$ 坐标影响。
 *   **后 36 维 (Y 轴)**：负责编码该 Patch 位于第几**行**。它只关心 $y$ 坐标，不受 $x$ 坐标影响。
 
-对于位置 $(x=3, y=5)$ 的 Patch：
-*   前 36 维用 $m=3$ 计算旋转角度：$3\theta_i$
-*   后 36 维用 $m=5$ 计算旋转角度：$5\theta_i$
+**数学矩阵视角**：
+二维位置的旋转矩阵 $\mathcal{R}_{x, y}$ 实质上是一个分块对角矩阵，相当于将一维特征分拆为 $x$ 旋转组与 $y$ 旋转组。
+$$ \mathcal{R}_{x, y} = \begin{pmatrix} \cos x\theta & -\sin x\theta & 0 & 0 \\ \sin x\theta & \cos x\theta & 0 & 0 \\ 0 & 0 & \cos y\theta & -\sin y\theta \\ 0 & 0 & \sin y\theta & \cos y\theta \end{pmatrix} $$
+
+**Torch 实现的重排列 (The 4-Chunk Trick)**：
+在 Qwen2-VL 的实现中，为了利用极致高效的 `rotate_half` 函数，代码必须将 `head_dim` 组织成四段结构。
+因为 1D-RoPE 是将特征劈成两半（前半和后半）来对应复平面的实部和虚部。而 2D-RoPE 有 $X$ 轴和 $Y$ 轴，所以它在 `head_dim` (如 `d`) 上会形成 `[x_cos, y_cos, x_cos, y_cos]` 和对应的 `sin` 的布局。
+- `rotary_pos_emb_full` 中 $X$ 和 $Y$ 各自占用了 $d/4$ 个角度频率。
+- 代码通过 `torch.cat([hpos_ids, wpos_ids], dim=-1)` 将行和列的索引拼在一起，最终查表出来的特征沿最后一个维度 Flatten。
+- 在与特征 $Q, K$ 结合时，由于 `rotate_half` 把 $d$ 维切成前 $d/2$ 和后 $d/2$，这就天然对应上了 `(X实部, Y实部)` 和 `(X虚部, Y虚部)`。
+
+具体应用层的公式映射为：
+$$ q_{embed} = (q \times \text{cos\_cat}) + (\text{rotate\_half}(q) \times \text{sin\_cat}) $$
 
 ### 2. 第一性原理：为什么它能支持任意分辨率？
 

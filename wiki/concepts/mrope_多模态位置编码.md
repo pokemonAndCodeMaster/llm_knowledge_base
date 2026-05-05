@@ -1,175 +1,146 @@
 ---
-title: MRoPE 多模态旋转位置编码
-tags: [概念, 位置编码, RoPE, 多模态, Qwen2.5-VL, LLM]
-created: 2026-05-03
-updated: 2026-05-03
-sources: 4
+title: MRoPE 多模态位置编码
+tags: [概念, 位置编码, RoPE, 多模态, Qwen2-VL, Qwen3-VL, 物理切分]
+created: 2026-05-04
+updated: 2026-05-04
+sources: 2
 status: active
 ---
 
-# MRoPE 多模态旋转位置编码
+# MRoPE 多模态位置编码 (Multimodal Rotary Positional Embedding)
 
-## 模块整体说明
+## 模块整体说明与架构拆解
 
-MRoPE (Multimodal Rotary Positional Embedding) 是 Qwen 多模态系列模型的**灵魂组件**，负责在 LLM 骨干网内部为混合了文本和视觉的序列提供三维时空位置信息。
+MRoPE (M-RoPE) 是 Qwen 团队为多模态大语言模型（LLM Backbone 端）量身定制的三维位置编码方案。
+**解决的核心痛点**：传统的 LLM 只有 1D RoPE，无法区分输入 Token 到底是一段文本，还是一张图片的局部，亦或是视频的某一帧。通过 MRoPE，模型在一个统一的向量空间内，同时感知到了空间结构的二维拓扑与时间流动的三维因果。
 
-**它解决的核心问题**：在多模态场景中，一个 Token 可能带有三个空间属性——时间 $T$（视频第几秒）、高度 $H$（图像的第几行）、宽度 $W$（图像的第几列）。传统的 1D-RoPE 只有一个位置维度，无法表达这种三维结构。MRoPE 就是把 1D-RoPE 扩展到三维的方案。
+### 演化路径：从 1D 到 3D
+MRoPE 的诞生并非凭空出现，它是随着模态复杂度的增加一步步演化而来的：
+1. **1D-RoPE（纯文本）**：只关心 Token 的先后顺序，`head_dim` 的所有维度都用来编码一个单一的位置索引 $m$。
+2. **2D-RoPE（单张图片）**：图像是二维的 $(x, y)$。将 `head_dim` 一分为二，一半用来编码横坐标 $x$，另一半用来编码纵坐标 $y$。（👉详见 [[2d_rope_视觉位置编码]]）
+3. **3D-MRoPE（多模态：文本+图片+视频）**：视频引入了时间维度（T）。为了统一处理所有模态，模型将 `head_dim` 物理切割为三个独立的段，分别用于捕捉多模态数据中的**时间 (Temporal)**、**高度 (Height)** 和 **宽度 (Width)** 的 3D 相对位置关系。
 
-**直观比喻**：1D-RoPE 就像一条直线上的门牌号——"第 1 号、第 2 号、第 3 号……"。但图像上的 Token 不是排成一条线的，而是排成一个平面网格（有行有列），视频的 Token 更是排成一个三维矩阵（有帧有行有列）。MRoPE 就像一个三维坐标系的地址——"3 楼 5 排 7 座"（时间=3，高度=5，宽度=7），让模型精确知道每个 Token 来自哪里。
+### 架构流转图示
+下面这张图直观地展示了 MRoPE 的切分原理：将 `hidden_dim`（或 `head_dim`）分成了三块，分别对应 T、H、W 维度的位置信息。
 
-**在全链路中的位置**：MRoPE 的位置 ID 在 Processor 阶段就计算好了（通过 `get_rope_index` 方法），但实际注入是在 LLM 骨干网的 Attention 计算中（作用在 Q 和 K 上）。
+![](<images/MRoPE-Lv1FbrhMOoQvoexh7uxcSRYfn6e.png>)
 
----
+MRoPE 的作用位置在于 **视觉特征经过 PatchMerger 投影后，与文本 Token 一并输入到 LLM Decoder 前**。
+
+```mermaid
+graph TD
+    A["输入: input_ids 混合序列 (文本与视觉特征)"] --> B["解析元数据: image_grid_thw, video_grid_thw"]
+    B --> C["为每个 Token 计算 3D 坐标 (T, H, W)"]
+    
+    C -->|"纯文本 Token"| D["T, H, W 三个坐标值完全一样且同步递增 (退化为 1D)"]
+    C -->|"视觉 Token"| E["按在视频/图片中的实际排布分配 (T, H, W)"]
+    
+    D --> F["提取各维度的 cos/sin 频率特征"]
+    E --> F
+    
+    F --> G["按照 mrope_section (如 16:24:24) 拼接旋转特征"]
+    G --> H["应用 apply_multimodal_rotary_pos_emb 旋转 LLM 的 Q 和 K"]
+```
 
 ## 逻辑链输入与输出
-
-- **逻辑链（输入）**：`position_ids` 张量，形状 `[3, Batch, Seq_len]`（3 代表 T, H, W 三个坐标）。
-- **逻辑链（输出）**：`cos` 和 `sin` 旋转矩阵，形状 `[Batch, Seq_len, Dim_rot]`，用于旋转 Q 和 K。
-
----
+- **逻辑链（输入）**：
+  - `position_ids`: 维度为 `[3, batch, seq_len]`，包含了序列中每个 Token 在 T, H, W 三个维度的绝对坐标索引。
+  - `mrope_section`: 一组划分比例配置，例如 `[16, 24, 24]`（用于切割 `head_dim`）。
+- **逻辑链（输出）**：
+  - 旋转后的 `Query` 和 `Key` 张量，已完美融入了 3D 时空位置信息。
 
 ## 核心算法原理详解
 
-### 1. RoPE 基础回顾
+### 1. 3D ID 序列的生成逻辑 (Token 级别的显微镜)
 
-RoPE 的核心思想：**用复数乘法（或等价的二维旋转矩阵）来表示绝对位置，从而在 Q·K 内积中自然地实现相对位置表达**。
+为了彻底理解 MRoPE，我们必须看看在实际序列中，`(T, H, W)` 这三个位置 ID 是如何生长的。
+**我们假设有一个输入序列，包含了一段视频（2帧，每帧2x2个Patch）和一段纯文本。**
+`input_ids`: `[V, V, V, V, V, V, V, V, T, T, T, T, T]`
+*(其中 V 表示视觉 Patch Token，T 表示文本 Token)*
 
-对于位置 $m$，特征维度的第 $i$ 对，旋转角度为 $m\theta_i$，其中逆频率 $\theta_i$ 按维度衰减：
+**它的 3D position_ids 分配如下：**
 
-$$\theta_i = base^{-2i/d}$$
+1. **视觉部分 (前 8 个 V)**：
+   - 第一帧的 4 个 Patch：
+     - `Temporal`: `[0, 0, 0, 0]` (同一帧的时间 ID 相同)
+     - `Height`  : `[0, 0, 1, 1]` (2x2 网格的行号)
+     - `Width`   : `[0, 1, 0, 1]` (2x2 网格的列号)
+   - 第二帧的 4 个 Patch：
+     - `Temporal`: `[1, 1, 1, 1]` (时间向后推进 1 步)
+     - `Height`  : `[0, 0, 1, 1]`
+     - `Width`   : `[0, 1, 0, 1]`
+2. **文本部分 (后 5 个 T)**：
+   - 文本没有长宽高，所以它的 T, H, W 坐标是**完全一致并且同步递增的**。
+   - 它的起始值是由前面视觉部分最大的 ID 推导出来的。前面最大的位置是 1，所以文本从 2 开始。
+   - `Temporal`: `[2, 3, 4, 5, 6]`
+   - `Height`  : `[2, 3, 4, 5, 6]`
+   - `Width`   : `[2, 3, 4, 5, 6]`
 
-位置 $m$ 的旋转编码应用到特征向量 $x$ 的第 $2i$ 和 $2i+1$ 维度上：
+*注：在 Qwen2.5-VL 中，时间 T 维度的 ID 进行了进一步升级，通过乘以真实的帧时间间隔，对齐了物理绝对秒数。*
 
-$$\begin{pmatrix} x'_{2i} \\ x'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}$$
+### 2. `head_dim` 的维度切割 (mrope_section)
+假设大模型的 `head_dim = 128`，那么其一半 `rotary_dim = 64`（对应公式里正余弦的角度个数）。
+系统需要将这 64 个角度分配给 T, H, W。在 Qwen 中，通过配置文件 `mrope_section: [16, 24, 24]` 来分配：
+- 前 16 维用于编码 **时间 (Temporal)** 位置。
+- 中间 24 维用于编码 **高度 (Height)** 位置。
+- 后 24 维用于编码 **宽度 (Width)** 位置。
+*加起来刚好 64 维。*
 
-**关键性质**：位置 $m$ 的 Q 和位置 $n$ 的 K 做内积时，结果只依赖于**相对距离** $m-n$。这就实现了"编码绝对位置，但 Attention 自动感知相对位置"。
+### 3. 特征交织与拼接 (Concatenation)
+这 64 个角度是如何扩展到 128 维的 `head_dim`，并在代码中施加旋转的？
+答案是每个维度切取一部分的位置编码，然后进行拼接得到最终的旋转位置编码：
 
-### 2. 从 1D-RoPE 到 3D-MRoPE
+![](<images/MRoPE-截屏2025-03-17 14.47.19.png>)
 
-**设计思路**：不把所有的特征维度都拿来做 T, H, W 的旋转。而是**将用于旋转编码的维度切分为 3 段**。
+在 `apply_multimodal_rotary_pos_emb` 源码中，为了与 `rotate_half` (前后两半对应虚实) 的复数旋转机制对齐，这 64 维的划分特征 `[16, 24, 24]` 被**复制了两次**，变成：
+`[16(T), 24(H), 24(W), 16(T), 24(H), 24(W)]` = 128 维。
 
-在 Qwen2.5-VL 的配置中，`mrope_section` 参数为 `[16, 24, 24]`，共 64 维（即 `head_dim // 2 = 128 // 2 = 64`）：
-- 前 16 维：编码时间 $T$ 的位置
-- 中间 24 维：编码高度 $H$ 的位置
-- 后 24 维：编码宽度 $W$ 的位置
+## 核心源码解剖
 
-每段独立计算各自的旋转频率：
-```
-freqs_T = compute_rope(position_ids[0], theta, dims=16)  # 时间维频率
-freqs_H = compute_rope(position_ids[1], theta, dims=24)  # 高度维频率
-freqs_W = compute_rope(position_ids[2], theta, dims=24)  # 宽度维频率
-freqs = concat(freqs_T, freqs_H, freqs_W)  # 拼接：[Batch, Seq_len, 64]
-```
-
-最后 `cat(freqs, freqs)` 镜像拼接到 128 维，分别求 `cos` 和 `sin`，用于旋转 Q 和 K。
-
-### 3. 三种输入类型的位置 ID 分配
-
-**核心逻辑图示**（时间步在不同视频帧间递增）：
-![MRoPE Illustration](../assets/qwen25_vl/v2-e6d08c686a68fb25fb3be108a9c6c4e1_r.jpg)
-
-**纯文本**：三个维度使用**相同的位置 ID**，等价于 1D-RoPE。
-```
-text:  T=[101, 102, 103], H=[101, 102, 103], W=[101, 102, 103]
-```
-
-**静态图像**：时间 ID 不变（只有一帧），H 和 W 按网格位置分配。
-```
-image: T=[0, 0, 0, 0], H=[0, 0, 1, 1], W=[0, 1, 0, 1]
-```
-
-**视频**：三个维度都有变化。
-
-### 4. Qwen2.5-VL 核心创新：绝对时间对齐 (Time-Absolute MRoPE)
-
-**来龙去脉**：在 Qwen2-VL 的 naive MRoPE 中，视频的时间 ID 只是简单递增（0, 1, 2, 3...），不反映真实的物理时间间隔。一个 2fps 的视频和一个 30fps 的视频，同样的 4 帧，时间 ID 都是 0-3，但前者跨越了 2 秒，后者只跨越了 0.13 秒。模型无法区分这种时间尺度差异。
-
-**Qwen2.5-VL 的突破**：MRoPE 的 Temporal 维度对齐了物理时间（秒）。
-
-**时间序列映射示意图**：
-![MRoPE Sequence](../assets/qwen25_vl/v2-086d610a300f59b3257bf1ff71829359_r.jpg)
-
-核心公式：
-
-$$interval = tokens\_per\_second \times \frac{temporal\_patch\_size}{fps}$$
-
-- `tokens_per_second`：每秒的时间 Token 数（超参数，如 25），定义时间粒度
-- `temporal_patch_size`：每个时间 Patch 包含多少帧（2）
-- `fps`：当前视频的帧率
-
-**数值示例**：
-```
-fps=1, tokens_per_second=25, temporal_patch_size=2
-interval = 25 × 2 / 1 = 50
-
-3 个时间 Patch, 每帧 2×2 = 4 个空间 Token:
-vision temporal position_ids: [0, 0, 0, 0, 50, 50, 50, 50, 100, 100, 100, 100]
-vision height position_ids:   [0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]
-vision width position_ids:    [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
-text temporal position_ids:   [101, 102, 103, 104, 105]
-text height position_ids:     [101, 102, 103, 104, 105]
-text width position_ids:      [101, 102, 103, 104, 105]
-```
-
-文本起始位置 = max(视觉位置) + 1 = 100 + 1 = 101。
-
-### 可训练参数与训练方式
-
-RoPE 的旋转矩阵（cos/sin 值）是基于固定公式计算的，**不包含可训练参数**。但它直接作用在 Attention 的可训练参数 $Q, K$ 上，通过改变 Q 和 K 的方向来注入位置信息。
-
----
-
-## 源码逐行解剖
-
-**代码路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+**代码路径**：`transformers/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py`
 
 ```python
-def get_rope_index(
-    self,
-    input_ids: torch.LongTensor,
-    image_grid_thw: Optional[torch.LongTensor] = None,
-    video_grid_thw: Optional[torch.LongTensor] = None,
-    second_per_grid_ts: Optional[torch.Tensor] = None,  # 每个时间步对应多少秒
-    attention_mask: Optional[torch.Tensor] = None,
-):
+# position_ids是一个[3, b, num_tokens], 每个token有3个方向temporal, height and width的位置编码id
+# cos.shape = [3,b,num_tokens, 128]
+# sin.shape = [3,b,num_tokens, 128]
+# q,k.shape = [b,n_head,num_tokens,dim] dim=128
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+    # mrope_section 初始为 [16, 24, 24]，乘 2 变为 [32, 48, 48] 
+    # 注意：实际代码中因为复数形式的前后半拼接，这里的切割逻辑是将 cos 拆分为 6 块
+    mrope_section = mrope_section * 2 
+    
+    # 按照 [16, 24, 24, 16, 24, 24] 将维度为 128 的 cos 劈开，
+    # 枚举的 i 从 0 到 5，i%3 分别等于 0, 1, 2, 0, 1, 2
+    # 这意味着:
+    # i=0 (前16维): 取 m[0] 即 cos[0] (Temporal)
+    # i=1 (中24维): 取 m[1] 即 cos[1] (Height)
+    # i=2 (后24维): 取 m[2] 即 cos[2] (Width)
+    # i=3 (又16维): 取 m[0] 即 cos[0] (Temporal, 后半复数对应)
     # ...
-    if modality_type == 2:  # 2 代表视频
-        # 基于物理真实秒数的绝对时间对齐
-        time_interval = tokens_per_second * int(next(second_per_grid_ts))
-    # ...
-
-# 在模型前向传播中：
-vision_outputs = self.visual(pixel_values, ...)
-image_embeds = vision_outputs.pooler_output  # [seq_len/4, 4096]
-
-# special_image_mask 是从 input_ids 算出的布尔掩码
-inputs_embeds[special_image_mask] = image_embeds  # 视觉特征替换占位符
+    cos_interleaved = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], 
+        dim=-1
+    ).unsqueeze(unsqueeze_dim)
+    
+    sin_interleaved = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], 
+        dim=-1
+    ).unsqueeze(unsqueeze_dim)
+    
+    # 0-15特征元素使用temporal类型的位置编码, 16-39使用height类型的位置编码, ...
+    q_embed = (q * cos_interleaved) + (rotate_half(q) * sin_interleaved)
+    k_embed = (k * cos_interleaved) + (rotate_half(k) * sin_interleaved)
+    return q_embed, k_embed
 ```
 
----
+在更新的 Qwen3-VL 架构中，系统进一步演化出了 **Interleaved MRoPE**。它的核心改进是将原先大块的 `[TTT... HHH... WWW...]` 排列，交错重组成了 `[THW THW THW ...]` 的细粒度高频交织结构，提升了对图像和视频时空特征的局部响应连续性，强化了模型的外推稳定性。
 
-## 版本演化对比
+## 质量自我审查与准出标准
 
-| 版本 | MRoPE 特性 | 频率排布 |
-|------|-----------|---------|
-| Qwen2-VL | 首次引入 3D-MRoPE（时间步均匀递增） | 分段 (Chunked) |
-| **Qwen2.5-VL** | **Time-Absolute MRoPE（对齐物理秒数）** | 分段 (Chunked) |
-| Qwen3-VL | 继续绝对时间 + **MRoPE-Interleave** | **交织** `[T1,H1,W1,T2,H2,W2...]` |
-| Qwen3.5 | 继续 + Partial RoPE（只有部分维度旋转） | 交织 |
-
----
+1.  **3D 索引推演清楚了吗？**：必须能闭眼写出一个包含 2 帧图像的视频（每帧 2x2 Patch）紧接一个文本 Token 时，所有的 (T, H, W) 坐标是如何分配的。
+2.  **维度切分明白了吗？**：能回答 `[16, 24, 24]` 这个 `mrope_section` 是如何最终变成 128 维的（因为实部虚部翻倍 `*2`）。
+3.  **文本退化懂了吗？**：理解为什么对于纯文本，T、H、W 的值必须同步一样，从而实现数学上向 1D RoPE 的完美退化。
 
 ## 关联概念
-
-- ✅ 支持 [[qwen2.5_vl_技术报告解析]]：绝对时间对齐是 LLM 端的核心改进。
-- 🔄 演化自 Qwen2-VL 的 naive MRoPE（时间步不对齐物理时间）。
-- 与 [[2d_rope_视觉位置编码]] 协作：ViT 内部用 2D-RoPE，LLM 内部用 3D-MRoPE。
-- 上游：位置 ID 在 Processor 阶段计算，实际注入在 LLM Attention 中。
-- 下游：位置信息影响 LLM 的 Q·K Attention 权重分布。
-- 替代了早期 [[qwen_vl_projector]] 中在 Projector 内使用 2D 绝对位置编码的方案。
-
-## 参考来源
-
-- 原始资料：`knowledge_base/Qwen2.5-VL/Qwen2.5-VL.md`
-- 前置知识：`qwen_learning_guide_phase0.md` §4 MRoPE
-- 学习指南：`knowledge_base/Qwen_Architecture_Guides/qwen_learning_guide_phase1.md`
+- 🔙 演化自：[[rope_旋转位置编码]] (奠定了基础的分段和复数旋转体系)
+- 🤝 上游模块：[[2d_rope_视觉位置编码]] (ViT 内部的 2D 版本，不处理时间维度)

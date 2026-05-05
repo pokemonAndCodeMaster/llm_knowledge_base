@@ -60,6 +60,11 @@ graph TD
 #### 第一性原理与原理解读
 *   **为什么不直接用 Linear 层？** 理论上对展平的 $3 \times 2 \times 14 \times 14$ 像素做 Linear 效果一致，但使用 `Conv3d` 能够保留卷积权重的空间局部性初始化策略（如 Xavier/Kaiming），且在代码表达上与视频理解论文（如 ViViT）保持语义一致。
 *   **静态图退化**：对于静态图，由于预处理时复制了帧（[img, img]），3D 卷积在时间维度的权重会学到一种“等值映射”，自动退化为 2D 空间特征提取。
+*   **卷积的归纳偏置 (Inductive Bias)**：卷积操作通过滑动窗口（Kernel）局部感知信号，天然具备平移不变性。相较于 Attention 的全局平方级开销，卷积能在初期以极低成本高效提炼边缘、角点及初级光流。
+*   **卷积输出尺寸的统一计算法则**：
+    无论是 1D、2D 还是 3D 卷积，其任意一维（长度 $L$、高度 $H$、宽度 $W$ 或深度 $D$）的输出尺寸计算都严格遵循以下下取整公式：
+    $$ Output\_Size = \left\lfloor \frac{Input\_Size + 2 \times Padding - Dilation \times (Kernel\_Size - 1) - 1}{Stride} \right\rfloor + 1 $$
+    在 Qwen2.5-VL 的时空切块器中，采用的是**无重叠、无填充**的极端特例：`Stride == Kernel_Size` 且 `Padding == 0, Dilation == 1`。因此，公式退化为极其暴力的块划分：$Output\_Size = Input\_Size / Kernel\_Size$。
 
 #### 核心源码解剖
 **文件路径**：`transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`

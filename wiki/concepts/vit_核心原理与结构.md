@@ -145,15 +145,31 @@ graph TD
   - **Layer 25-32 (全局语义)**：通过每 8 层一次的全局注意力，模型终于看清了“这是一个正蹲在草地上盯着蝴蝶的猫”。
 - **结论**：**堆叠的深度决定了模型抽象能力的上限**。如果只有 1 层，模型永远只能看到像素点，无法建立宏观联系。
 
-### 2. 架构统一：视觉侧的“LLM 化”
+### 2. 渊源与演化：原始 ViT (2020) vs Qwen 视觉侧的“LLM 化”
 
-Qwen2.5-VL 相比前代最核心的哲学转变是：**让视觉编码器长得越来越像 LLM**。
-- **归一化策略**：抛弃传统 ViT 的 LayerNorm，改用 LLM 标配的 [[rmsnorm_归一化]]。
-- **非线性激活**：抛弃 GELU，改用与 Qwen2.5 文本端完全一致的 [[swiglu_门控激活函数]]。
-- **位置编码**：引入 [[2d_rope_视觉位置编码]]。
+要深刻理解 Qwen2.5-VL 的视觉架构，我们必须追溯到它的老祖宗：Google 于 2020 年提出的原始 Vision Transformer (ViT)。原始 ViT 首次证明了：**不需要卷积神经网络 (CNN) 的强空间归纳偏置，只要数据量足够大，纯 Transformer 也能在图像领域创造奇迹。**
+
+**原始 ViT 的数据流 (2020)**：
+![](<images/ViT(2020, Google Research)-image.png>)
+
+1.  **Patch Embedding**：将 $H \times W \times C$ 的三维图像暴力展平为 $N \times (P^2 \cdot C)$ 的 2D 序列，每个 Patch 作为一个独立的 Token。
+2.  **CLS Token**：在序列开头强行插入一个可学习的 `[CLS]` Token，用于在最后输出时聚合全图特征做分类。
+3.  **1D Positional Embedding**：直接把一个与序列等长的 1D 可学习张量“加（Add）”到 Patch Token 上，这是绝对位置编码。
+4.  **Transformer Encoder**：标准的 `LayerNorm -> Multi-Head Attention -> LayerNorm -> MLP (GELU)` 堆叠。
+
+**强类比对比：Qwen2.5-VL 的颠覆性“LLM 化”**
+Qwen 团队并没有照搬原始 ViT，而是做出了核心哲学转变——**让视觉编码器长得越来越像 LLM**，以此降低跨模态对齐的“方言差”。
+
+| 组件 | 原始 ViT (2020) | Qwen2.5-VL ViT | 演化本质与原理解读 |
+| :--- | :--- | :--- | :--- |
+| **位置编码** | 1D 可学习绝对位置，**直接加 (Add)** 在输入上。数学本质是 $W(I+P)=WI+WP$，相加等价于一种特殊的高效 Concatenate | **2D-RoPE**，在 Attention 内部进行复数旋转 | 绝对位置编码锁死了分辨率，2D-RoPE 天然支持任意分辨率和长宽比外推。 |
+| **全局聚合** | 依赖序列开头的 `[CLS]` Token | **抛弃 `[CLS]` Token**，全部 Token 降维后送入 LLM | MLLM 不需要做简单的图像分类，而是需要密集的局部和全局语义输入给 LLM。 |
+| **归一化策略** | LayerNorm | **RMSNorm** | 抛弃均值平移，与 Qwen2.5 文本端完全对齐，提升计算速度。 |
+| **非线性激活** | GELU | **SwiGLU (且 bias=True)** | 文本端使用无偏置 SwiGLU，视觉端为了对抗传感器直流偏移底噪开启偏置。 |
+| **注意力范围** | 每层都是全图 Global Attention | **Window Attention** 为主，1/8 的层穿插 Global | 在原生极高分辨率下，$O(N^2)$ 全图计算会 OOM，交错窗口既省算力又保住了宏观意图。 |
 
 **这种“架构统一”的终极物理意义**：
-视觉特征与文本特征在数学分布上越接近，跨模态对齐（Alignment）的难度就越低。它就像是让两个说不同方言的人改说普通话，沟通效率会极大提升。
+视觉特征与文本特征在数学分布和底层算子（RMSNorm, SwiGLU, RoPE）上越接近，后续在 Stage 1/2 进行跨模态对齐（Alignment）的难度就越低。就像让两个说不同方言的人改说普通话，沟通效率会极大提升。
 
 ---
 

@@ -138,6 +138,34 @@ class Qwen2_5_VLPatchMerger(nn.Module):
         return x  # 输出 [seq_len / 4, 4096]
 ```
 
+### Qwen3.5 源码解剖：回归大道至简
+
+在 Qwen3-VL 中，为了增强细粒度，官方引入了极其复杂的 `DeepStack` 跨层融合（抽出 ViT 第 8、16、24 层特征注入 LLM）。
+但在最新的 **Qwen3.5** 中，由于其语言底座（Gated DeltaNet + MoE）已经足够强大，不需要依赖复杂的跨层视觉补偿。因此 Qwen3.5 废弃了 DeepStack，完全回归了 Qwen2.5-VL 这种最原始的 PatchMerger。
+
+**代码路径**：`transformers/src/transformers/models/qwen3_5/modeling_qwen3_5.py`
+```python
+class Qwen3_5VisionPatchMerger(nn.Module):
+    def __init__(self, config: Qwen3_5VisionConfig, use_postshuffle_norm=False) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.use_postshuffle_norm = use_postshuffle_norm
+        # 如果不开 postshuffle，则在这里做归一化
+        self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
+        
+        # 原汁原味的两层 MLP
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 完全相同的张量形变魔法 .view(-1, self.hidden_size)
+        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+        return x
+```
+这段实锤代码证明了：**Qwen3.5 并不是没有视觉端创新，而是刻意采用了“返璞归真”的设计哲学，将所有的推理压力交给了极致优化的 LLM 基座。**
+
 ---
 
 ## 版本演化对比

@@ -250,6 +250,7 @@
   },
   "active": "342dbe85798c88d9",
   "lastOpenFiles": [
+    "concepts/qwen3.5_原生多模态训练范式.md",
     "concepts/convolution_卷积家族原理.md",
     "concepts/vit_核心原理与结构.md",
     "synthesis/qwen3.5_深度剖析学习指南.md",
@@ -286,7 +287,6 @@
     "concepts/qwen2.5_vl_预处理框架集成与显存评估.md",
     "未命名.md",
     "log.md",
-    "index.md",
     "assets/qwen25_vl",
     "assets",
     "synthesis/_fix_guide.py"

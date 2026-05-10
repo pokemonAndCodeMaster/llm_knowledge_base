@@ -37,6 +37,34 @@
             }
           },
           {
+            "id": "7709fde1657053bd",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "concepts/qwen3.5_processor预处理.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "qwen3.5_processor预处理"
+            }
+          },
+          {
+            "id": "d35944a50e68249b",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "concepts/qwen3.5_processor预处理.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "qwen3.5_processor预处理"
+            }
+          },
+          {
             "id": "5c32842d39f25b4f",
             "type": "leaf",
             "state": {
@@ -223,9 +251,11 @@
   },
   "active": "7014a79bb51afbd8",
   "lastOpenFiles": [
-    "concepts/qwen3.5_视觉编码器.md",
-    "synthesis/qwen3.5_深度剖析学习指南.md",
     "concepts/qwen3.5_processor预处理.md",
+    "concepts/qwen2.5_vl_预处理流水线.md",
+    "synthesis/qwen3.5_深度剖析学习指南.md",
+    "concepts/conv3d_时空切块器.md",
+    "concepts/qwen3.5_视觉编码器.md",
     "concepts/qwen3.5_文本嵌入与特殊token.md",
     "concepts/qwen3.5_前向传播全链路.md",
     "synthesis/images/qwen3.5/Qwen-3.5 Preview-archtecture.jpg",
@@ -237,7 +267,6 @@
     "synthesis/images/qwen3.5/Qwen-3.5 Preview-archtecture-2.png",
     "synthesis/images/qwen3.5/Qwen-3.5 Preview-archtecture-1.png",
     "synthesis/images/qwen3.5",
-    "concepts/conv3d_时空切块器.md",
     "concepts/qwen3.5_gated_delta_net.md",
     "concepts/mrope_多模态位置编码.md",
     "concepts/qwen3.5_多模态融合机制.md",
@@ -245,7 +274,6 @@
     "concepts/clip_对比学习视觉编码.md",
     "concepts/vit_核心原理与结构.md",
     "concepts/convolution_卷积家族原理.md",
-    "concepts/qwen2.5_vl_预处理流水线.md",
     "concepts/qwen3.5_interleaved_mrope.md",
     "concepts/qwen_代码地图.md",
     "concepts/qwen3.5_混合decoder架构.md",

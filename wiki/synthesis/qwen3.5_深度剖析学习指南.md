@@ -406,7 +406,7 @@ mm_type:   [ 0,   0,   0,  0,   1×256,     0,  0,  0, 0, ...]
 
 **来龙去脉**：这是 Qwen3.5 最精华、最硬核的部分。为支撑超长上下文，Qwen3.5 将经典的全 Attention Decoder 替换为**混合架构**：通过 `config.layer_types` 指定每层是 Full Attention 还是 GatedDeltaNet（线性注意力），再接 MLP/MoE。
 
-![Qwen3.5 混合层架构](images/qwen3.5/Qwen-3.5%20Preview-archtecture.png)
+![Qwen3.5 混合层架构|537](images/qwen3.5/Qwen-3.5%20Preview-archtecture-1.png)
 
 **架构流转图示**：
 ```mermaid

@@ -187,6 +187,8 @@ class Qwen3_5VisionPatchMerger(nn.Module):
 - 🔄 演化自 Qwen2-VL PatchMerger：唯一变化是 Norm 从 LayerNorm 换成 [[rmsnorm_归一化]]。
 - 属于 [[动态分辨率方案对比]] 中"基于变换的压缩"方案。
 - 训练策略：[[qwen2.5_vl_三阶段预训练]]。
+- ✅ 支持：[[qwen3.5_视觉编码器]] (Qwen3.5 视觉编码全链路)
+- ✅ 支持：[[qwen3.5_前向传播全链路]] (Qwen3.5 前向传播全链路)
 
 ## 参考来源
 

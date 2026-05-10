@@ -9,6 +9,7 @@
 | 文件 | 摘要 |
 |---|---|
 | [[qwen2.5_vl_深度剖析学习指南]] | Qwen2.5-VL 全链路硬核学习指南：从 Processor 预处理到 LLM 自回归解码的完整五模块无死角串联 |
+| [[qwen3.5_深度剖析学习指南]] | Qwen3.5 架构剖析：混合 Decoder（Attention + GatedDeltaNet）+ 视觉管线全链路 |
 
 ---
 
@@ -31,6 +32,25 @@
 |---|---|
 | [[2d_rope_视觉位置编码]] | 2D-RoPE 视觉位置编码：ViT 内部使用，将 head_dim 均分为 X/Y 两轴独立旋转 |
 | [[mrope_多模态位置编码]] | MRoPE 多模态旋转位置编码：LLM 内部的三维时空编码 (T,H,W)，Qwen2.5-VL 对齐绝对物理时间 |
+| [[qwen3.5_interleaved_mrope]] | Qwen3.5 交错式 MRoPE：频率 [THWTHW...] 交错排列 + 4D position_ids + partial_rotary_factor |
+
+### 💻 代码导航
+
+| 文件 | 摘要 |
+|---|---|
+| [[qwen_代码地图]] | **Qwen 全系列代码总入口**：跨 4 仓库（Transformers/vLLM/Swift/LLaMA-Factory）的文件索引、类继承关系、阅读路线图 |
+| [[qwen3.5_前向传播全链路]] | **Qwen3.5 前向传播完整流转**：全函数调用链 + 张量形状追踪（已合并至 [[qwen3.5_深度剖析学习指南]]） |
+
+### 🧬 Qwen3.5 架构组件
+
+| 文件 | 摘要 |
+|---|---|
+| [[qwen3.5_混合decoder架构]] | 混合 Decoder：Full Attention ↔ GatedDeltaNet 交替层、双 Mask 系统、KV Cache 管理 |
+| [[qwen3.5_gated_delta_net]] | GatedDeltaNet 线性注意力：Gated Delta Rule 算法、Conv1d 局部感知、RMSNormGated |
+| [[qwen3.5_视觉编码器]] | 视觉编码器：Conv3d PatchEmbed → 插值位置嵌入 → 2D RoPE → 32×VisionBlock → PatchMerger |
+| [[qwen3.5_多模态融合机制]] | 多模态融合：占位符 masked_scatter 替换、DeepStack 移除、特殊 token ID 定义 |
+| [[qwen3.5_processor预处理]] | Processor 预处理：mm_token_type_ids 模态标记、视频帧时间戳、占位符展开逻辑 |
+| [[qwen3.5_文本嵌入与特殊token]] | 文本嵌入：nn.Embedding 查表、ChatML 模板结构、特殊 Token 角色、占位 Embedding 生命周期 |
 
 ### 📐 架构对比
 

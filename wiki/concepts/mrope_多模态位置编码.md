@@ -1,8 +1,8 @@
 ---
 title: MRoPE 多模态位置编码
-tags: [概念, 位置编码, RoPE, 多模态, Qwen2-VL, Qwen3-VL, 物理切分]
+tags: [概念, 位置编码, RoPE, 多模态, Qwen2-VL, Qwen3-VL, Qwen3.5, 物理切分]
 created: 2026-05-04
-updated: 2026-05-04
+updated: 2026-05-10
 sources: 2
 status: active
 ---
@@ -135,12 +135,38 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
 
 在更新的 Qwen3-VL 架构中，系统进一步演化出了 **Interleaved MRoPE**。它的核心改进是将原先大块的 `[TTT... HHH... WWW...]` 排列，交错重组成了 `[THW THW THW ...]` 的细粒度高频交织结构，提升了对图像和视频时空特征的局部响应连续性，强化了模型的外推稳定性。
 
+---
+
+## Qwen3.5 Interleaved MRoPE 详解
+
+Qwen3.5 对 MRoPE 进行了重要升级，采用**交错式排列**替代原先的连续块排列。
+
+### 配置差异
+
+| 参数 | Qwen2.5-VL | Qwen3.5 |
+|------|-----------|--------|
+| `mrope_section` | `[16, 24, 24]` (总和=64) | `[11, 11, 10]` (总和=32) |
+| `partial_rotary_factor` | 1.0 | 可配置（部分旋转） |
+| 排列方式 | 连续块 `[TTT...HHH...WWW]` | 交错 `[THWTHWTHW...]` |
+
+### 交错排列的物理意义
+
+原先的 chunked 方式：某些维度可能只分配到高频维度（信息量低），导致位置感知不均衡。交错排列让每个维度都能获得低频和高频的旋转信号，位置感知更均匀。
+
+详细的源码解剖、频率索引推演和 4D position_ids 说明请见 [[qwen3.5_interleaved_mrope]]。
+
+---
+
 ## 质量自我审查与准出标准
 
 1.  **3D 索引推演清楚了吗？**：必须能闭眼写出一个包含 2 帧图像的视频（每帧 2x2 Patch）紧接一个文本 Token 时，所有的 (T, H, W) 坐标是如何分配的。
 2.  **维度切分明白了吗？**：能回答 `[16, 24, 24]` 这个 `mrope_section` 是如何最终变成 128 维的（因为实部虚部翻倍 `*2`）。
 3.  **文本退化懂了吗？**：理解为什么对于纯文本，T、H、W 的值必须同步一样，从而实现数学上向 1D RoPE 的完美退化。
+4.  **Qwen3.5 交错式理解了吗？**：能解释 `[THWTHWTHW...]` vs `[TTT...HHH...WWW...]` 的优势。
 
 ## 关联概念
 - 🔙 演化自：[[rope_旋转位置编码]] (奠定了基础的分段和复数旋转体系)
 - 🤝 上游模块：[[2d_rope_视觉位置编码]] (ViT 内部的 2D 版本，不处理时间维度)
+- 🔄 演化为：[[qwen3.5_interleaved_mrope]] (Qwen3.5 交错式 MRoPE 详解)
+- ✅ 支持：[[qwen3.5_前向传播全链路]] (Qwen3.5 全链路流转)
+- ✅ 支持：[[qwen3.5_多模态融合机制]] (position_ids 计算来源)

@@ -1,8 +1,8 @@
 ---
 title: Conv3d 时空切块器 (VisionPatchEmbed)
-tags: [概念, 视觉编码器, 卷积, Patch, Qwen2.5-VL, Tubelet]
+tags: [概念, 视觉编码器, 卷积, Patch, Qwen2.5-VL, Qwen3.5, Tubelet]
 created: 2026-05-03
-updated: 2026-05-04
+updated: 2026-05-10
 sources: 5
 status: active
 ---
@@ -127,7 +127,8 @@ hidden_states = hidden_states.view(-1, self.embed_dim)
 
 ## 数值计算示例
 
-假设输入一张 $112 \times 112$ 的缩略图，静态模式：
+### Qwen2.5-VL 示例（112×112 缩略图）
+
 1.  **预处理**：产生 $T=2, H=112, W=112$。
 2.  **切块数计算**：
     *   $T\_grid = 2 / 2 = 1$
@@ -138,6 +139,55 @@ hidden_states = hidden_states.view(-1, self.embed_dim)
 4.  **Conv3d 权重**：`[1152, 3, 2, 14, 14]`。
 5.  **输出结果**：`[64, 1152]`。
 6.  **结论**：该图在进入骨干网前，转化为 64 个 1152 维的 Token。
+
+### Qwen3.5 示例（448×448 图像）
+
+沿用 [[qwen3.5_前向传播全链路]] 的统一推演样本：
+
+1.  **预处理**：448÷14=32, T=1(图像)→补帧到T=2
+2.  **切块数**：$1 \times 32 \times 32 = 1024$ 个 Patch
+3.  **Conv3d 输入**：`[1024, 3, 2, 14, 14]`
+4.  **Conv3d 权重**：`[1280, 3, 2, 14, 14]`（注意：embed_dim=**1280**，非1152）
+5.  **输出结果**：`[1024, 1280]`
+6.  **后续**：1024 个 Token → PatchMerger 2×2 → 256 个 Token → 送入 LLM
+
+---
+
+## Qwen3.5 版本特性
+
+Qwen3.5 的 PatchEmbed 继承自 `Qwen3VLVisionPatchEmbed`（进而继承自 Qwen2.5-VL 的实现），核心结构完全一致，差异仅在配置参数：
+
+| 参数 | Qwen2.5-VL | Qwen3.5 |
+|------|-----------|--------|
+| `embed_dim` | 1152 | **1280** |
+| `patch_size` | 14 | 14 |
+| `temporal_patch_size` | 2 | 2 |
+| `bias` | False | **True** |
+| `in_channels` | 3 | 3 |
+
+**为什么 embed_dim 从 1152 变成 1280？** Qwen3.5 的 ViT 骨干网更宽（1280 维 hidden_size），而 Qwen2.5-VL 是 1152 维。这是模型规模的自然演化。
+
+**为什么加了 bias？** Qwen2.5-VL 的 Conv3d 不带偏置（`bias=False`），但 Qwen3.5 加上了。偏置允许卷积核有一个「默认激活值」，在某些通道全黑/全白区域仍能输出非零特征。
+
+```python
+# Qwen3.5 PatchEmbed 继承链:
+# Qwen3_5VisionModel → Qwen3VLVisionModel → 内含 Qwen3VLVisionPatchEmbed
+# Qwen3VLVisionPatchEmbed 与 Qwen2_5_VisionPatchEmbed 结构完全一致
+# 仅 config 参数不同
+
+# 文件: models/qwen3_vl/modeling_qwen3_vl.py:72-89
+class Qwen3VLVisionPatchEmbed(nn.Module):
+    def __init__(self, config):
+        kernel_size = [config.temporal_patch_size, config.patch_size, config.patch_size]
+        # = [2, 14, 14]
+        self.proj = nn.Conv3d(
+            config.in_channels,     # 3
+            config.hidden_size,     # 1280 (Qwen3.5)
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=getattr(config, 'patch_embed_bias', True)  # Qwen3.5: True
+        )
+```
 
 ---
 
@@ -170,8 +220,11 @@ hidden_states = hidden_states.view(-1, self.embed_dim)
 - [[qwen2.5_vl_预处理流水线]]：上游模块，负责将原始图像揉捏成本模块需要的 5D 张量。
 - [[2d_rope_视觉位置编码]]：下游模块，负责在本模块展平后找回几何坐标。
 - [[patchmerger_空间降维]]：下游模块，利用本模块输出的 2×2 连续性进行 4 倍降采样。
+- [[qwen3.5_视觉编码器]]：Qwen3.5 完整视觉编码链路 ✅ 支持
+- [[qwen3.5_前向传播全链路]]：Qwen3.5 前向传播全链路 ✅ 支持
 
 ## 参考来源
 - `knowledge_base/raw/万字长文图解Qwen2.5-VL实现细节_猛猿_2025-06-25/index.md`
 - `transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py`
+- `transformers/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py`
 - 论文：*ViViT: A Video Vision Transformer* (arXiv:2103.15691)
